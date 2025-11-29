@@ -11,7 +11,7 @@ import "./Mocks.sol";
  * @dev All tests should FAIL in red phase - this validates test correctness before implementation
  */
 contract PhlimboTest is Test {
-    PhlimboEa public phlimbo;
+    PhlimboEA public phlimbo;
     MockYieldStrategy public yieldStrategy;
     MockFlax public phUSD;
     MockStable public stable;
@@ -33,7 +33,7 @@ contract PhlimboTest is Test {
         eye = new MockEYE();
 
         // Deploy Phlimbo
-        phlimbo = new PhlimboEa(
+        phlimbo = new PhlimboEA(
             address(yieldStrategy),
             address(phUSD),
             address(stable),

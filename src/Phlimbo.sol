@@ -9,11 +9,11 @@ import "@flax-token/src/IFlax.sol";
 import "./IEYE.sol";
 
 /**
- * @title PhlimboEa
+ * @title PhlimboEA
  * @notice Staking yield farm for phUSD tokens with dynamic APY based on YieldStrategy performance
  * @dev Integrates with YieldStrategy for stable token yield and mints phUSD rewards based on APY targets
  */
-contract PhlimboEa is Ownable, Pausable {
+contract PhlimboEA is Ownable, Pausable {
     // ========================== STATE VARIABLES ==========================
 
     /// @notice The yield strategy adapter for managing external vault deposits
