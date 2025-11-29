@@ -109,6 +109,10 @@ contract PhlimboTest is Test {
     }
 
     function test_withdraw_claims_rewards() public {
+        // Setup principal in YieldStrategy so emission can be calculated
+        yieldStrategy.setPrincipal(address(stable), minter, 100000 ether);
+        yieldStrategy.setTotal(address(stable), minter, 100000 ether);
+
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT);
 
@@ -138,6 +142,10 @@ contract PhlimboTest is Test {
     // ========================== CLAIM TESTS ==========================
 
     function test_claim_distributes_stable() public {
+        // Setup principal and yield in YieldStrategy
+        yieldStrategy.setPrincipal(address(stable), minter, 1000 ether);
+        yieldStrategy.setTotal(address(stable), minter, 1100 ether); // 100 ether yield available
+
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT);
 
@@ -157,6 +165,10 @@ contract PhlimboTest is Test {
     }
 
     function test_claim_mints_phUSD() public {
+        // Setup principal in YieldStrategy so emission can be calculated
+        yieldStrategy.setPrincipal(address(stable), minter, 100000 ether);
+        yieldStrategy.setTotal(address(stable), minter, 100000 ether);
+
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT);
 
@@ -179,6 +191,10 @@ contract PhlimboTest is Test {
     // ========================== APY TESTS ==========================
 
     function test_setDesiredAPY_updates_emission_rate() public {
+        // Setup principal in YieldStrategy so emission can be calculated
+        yieldStrategy.setPrincipal(address(stable), minter, 100000 ether);
+        yieldStrategy.setTotal(address(stable), minter, 100000 ether);
+
         uint256 emissionBefore = phlimbo.phUSDPerSecond();
 
         phlimbo.setDesiredAPY(500); // 5% APY
@@ -271,6 +287,10 @@ contract PhlimboTest is Test {
     // ========================== REWARD CALCULATION TESTS ==========================
 
     function test_rewards_proportional_to_stake() public {
+        // Setup principal in YieldStrategy so emission can be calculated
+        yieldStrategy.setPrincipal(address(stable), minter, 100000 ether);
+        yieldStrategy.setTotal(address(stable), minter, 100000 ether);
+
         // Alice stakes 2x Bob's amount
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT * 2);
@@ -292,6 +312,10 @@ contract PhlimboTest is Test {
     }
 
     function test_rewards_accumulate_over_time() public {
+        // Setup principal in YieldStrategy so emission can be calculated
+        yieldStrategy.setPrincipal(address(stable), minter, 100000 ether);
+        yieldStrategy.setTotal(address(stable), minter, 100000 ether);
+
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT);
 
@@ -336,6 +360,7 @@ contract PhlimboTest is Test {
     function test_emission_rate_based_on_yield_principal() public {
         // Setup principal in YieldStrategy
         yieldStrategy.setPrincipal(address(stable), minter, 100000 ether);
+        yieldStrategy.setTotal(address(stable), minter, 100000 ether);
 
         phlimbo.setDesiredAPY(500); // 5% APY
 
@@ -374,6 +399,11 @@ contract PhlimboTest is Test {
     // ========================== VIEW FUNCTION TESTS ==========================
 
     function test_pendingPhUSD_returns_correct_amount() public {
+        // Setup principal in YieldStrategy so emission can be calculated
+        // Use same amount as staked so APY calculation is straightforward
+        yieldStrategy.setPrincipal(address(stable), minter, STAKE_AMOUNT);
+        yieldStrategy.setTotal(address(stable), minter, STAKE_AMOUNT);
+
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT);
 
@@ -382,8 +412,9 @@ contract PhlimboTest is Test {
 
         uint256 pending = phlimbo.pendingPhUSD(alice);
 
-        // With 5% APY on STAKE_AMOUNT for 1 year
-        // Red phase: this will fail because phUSDPerSecond is 0
+        // With 5% APY on STAKE_AMOUNT (which equals principal) for 1 year
+        // Since Alice has 100% of total staked, she gets 100% of emissions
+        // Emissions = (principal * APY) / 10000 = (STAKE_AMOUNT * 500) / 10000
         uint256 expectedReward = (STAKE_AMOUNT * 500) / 10000; // 5% of stake
         assertApproxEqRel(pending, expectedReward, 0.02e18, "Pending rewards should match APY calculation");
     }

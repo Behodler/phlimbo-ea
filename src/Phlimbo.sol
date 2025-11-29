@@ -256,8 +256,17 @@ contract PhlimboEA is Ownable, Pausable {
      * @notice Harvests stable yield from YieldStrategy
      */
     function _harvestStable() internal {
-        // STUB: In red phase, this does nothing
-        // Green phase will implement actual yield harvesting logic
+        uint256 totalBalance = yieldStrategy.totalBalanceOf(address(stable), minter);
+        uint256 principal = yieldStrategy.principalOf(address(stable), minter);
+
+        if (totalBalance > principal) {
+            uint256 yieldAmount = totalBalance - principal;
+            yieldStrategy.withdrawFrom(address(stable), minter, yieldAmount, address(this));
+
+            if (totalStaked > 0) {
+                accStablePerShare += (yieldAmount * PRECISION) / totalStaked;
+            }
+        }
     }
 
     /**
@@ -265,9 +274,11 @@ contract PhlimboEA is Ownable, Pausable {
      * @return Emission rate in phUSD per second
      */
     function _calculatePhUSDPerSecond() internal view returns (uint256) {
-        // STUB: Returns 0 in red phase
-        // Green phase will query YieldStrategy for totalPrincipal and calculate emission
-        return 0;
+        uint256 totalPrincipal = yieldStrategy.totalBalanceOf(address(stable), minter);
+        if (totalPrincipal == 0) {
+            return 0;
+        }
+        return (totalPrincipal * desiredAPYBps) / 10000 / SECONDS_PER_YEAR;
     }
 
     /**
@@ -284,15 +295,13 @@ contract PhlimboEA is Ownable, Pausable {
         // Calculate pending phUSD
         uint256 pendingPhUSDAmount = (userDetails.amount * accPhUSDPerShare) / PRECISION - userDetails.phUSDDebt;
         if (pendingPhUSDAmount > 0) {
-            // STUB: In red phase, this doesn't actually mint
-            // Green phase will: phUSD.mint(user, pendingPhUSDAmount);
+            phUSD.mint(user, pendingPhUSDAmount);
         }
 
         // Calculate pending stable
         uint256 pendingStableAmount = (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;
         if (pendingStableAmount > 0) {
-            // STUB: In red phase, this doesn't actually transfer
-            // Green phase will: stable.transfer(user, pendingStableAmount);
+            stable.transfer(user, pendingStableAmount);
         }
     }
 

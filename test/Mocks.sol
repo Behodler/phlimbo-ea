@@ -48,8 +48,12 @@ contract MockYieldStrategy is IYieldStrategy {
         // No-op for testing
     }
 
-    function withdrawFrom(address, address, uint256, address) external override {
-        // No-op for testing
+    function withdrawFrom(address token, address account, uint256 amount, address recipient) external override {
+        // Withdraw from account's balance and reduce totals
+        require(totals[token][account] >= amount, "Insufficient balance");
+        totals[token][account] -= amount;
+        // In a real implementation, tokens would be transferred to recipient
+        // For testing, we just reduce the tracked balance
     }
 
     // Test helpers
