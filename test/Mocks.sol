@@ -4,7 +4,6 @@ pragma solidity ^0.8.19;
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@reflax-yield-vault/src/interfaces/IYieldStrategy.sol";
 import "@flax-token/src/IFlax.sol";
-import "../src/IEYE.sol";
 
 /**
  * @title MockYieldStrategy
@@ -110,21 +109,5 @@ contract MockStable is ERC20 {
 
     function mint(address to, uint256 amount) external {
         _mint(to, amount);
-    }
-}
-
-/**
- * @title MockEYE
- * @notice Mock EYE token for testing
- */
-contract MockEYE is ERC20, IEYE {
-    constructor() ERC20("Mock EYE", "mEYE") {}
-
-    function mint(address to, uint256 amount) external {
-        _mint(to, amount);
-    }
-
-    function burn(uint256 value) external override {
-        _burn(msg.sender, value);
     }
 }

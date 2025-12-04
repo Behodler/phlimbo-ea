@@ -15,12 +15,12 @@ contract PhlimboTest is Test {
     MockYieldStrategy public yieldStrategy;
     MockFlax public phUSD;
     MockStable public stable;
-    MockEYE public eye;
 
     address public owner = address(this);
     address public alice = address(0x1);
     address public bob = address(0x2);
     address public minter = address(0x3);
+    address public pauser = address(0x4);
 
     uint256 constant INITIAL_BALANCE = 10000 ether;
     uint256 constant STAKE_AMOUNT = 1000 ether;
@@ -30,15 +30,13 @@ contract PhlimboTest is Test {
         yieldStrategy = new MockYieldStrategy();
         phUSD = new MockFlax();
         stable = new MockStable();
-        eye = new MockEYE();
 
         // Deploy Phlimbo
         phlimbo = new PhlimboEA(
             address(yieldStrategy),
             address(phUSD),
             address(stable),
-            minter,
-            address(eye)
+            minter
         );
 
         // Set up phUSD minter
@@ -48,18 +46,15 @@ contract PhlimboTest is Test {
         phUSD.mint(alice, INITIAL_BALANCE);
         phUSD.mint(bob, INITIAL_BALANCE);
         stable.mint(address(phlimbo), INITIAL_BALANCE);
-        eye.mint(alice, INITIAL_BALANCE);
-        eye.mint(bob, INITIAL_BALANCE);
 
         // Approve Phlimbo to spend tokens
         vm.prank(alice);
         phUSD.approve(address(phlimbo), type(uint256).max);
         vm.prank(bob);
         phUSD.approve(address(phlimbo), type(uint256).max);
-        vm.prank(alice);
-        eye.approve(address(phlimbo), type(uint256).max);
-        vm.prank(bob);
-        eye.approve(address(phlimbo), type(uint256).max);
+
+        // Set up pauser
+        phlimbo.setPauser(pauser);
     }
 
     // ========================== STAKING TESTS ==========================
@@ -215,19 +210,37 @@ contract PhlimboTest is Test {
 
     // ========================== PAUSE MECHANISM TESTS ==========================
 
-    function test_pause_burns_eye() public {
-        uint256 eyeBefore = eye.balanceOf(alice);
+    function test_setPauser_updates_pauser_address() public {
+        address newPauser = address(0x999);
+        phlimbo.setPauser(newPauser);
+        assertEq(phlimbo.pauser(), newPauser, "Pauser should be updated");
+    }
 
+    function test_setPauser_accepts_zero_address() public {
+        phlimbo.setPauser(address(0));
+        assertEq(phlimbo.pauser(), address(0), "Pauser should accept zero address");
+    }
+
+    function test_setPauser_only_owner() public {
         vm.prank(alice);
+        vm.expectRevert();
+        phlimbo.setPauser(alice);
+    }
+
+    function test_pause_requires_pauser() public {
+        vm.prank(pauser);
         phlimbo.pause();
+        assertTrue(phlimbo.paused(), "Pauser should be able to pause");
+    }
 
-        uint256 eyeAfter = eye.balanceOf(alice);
-
-        assertEq(eyeBefore - eyeAfter, phlimbo.PAUSE_EYE_COST(), "Pause should burn 1000 EYE");
+    function test_pause_rejects_non_pauser() public {
+        vm.prank(alice);
+        vm.expectRevert("Only pauser can pause");
+        phlimbo.pause();
     }
 
     function test_pause_prevents_staking() public {
-        vm.prank(alice);
+        vm.prank(pauser);
         phlimbo.pause();
 
         vm.prank(bob);
@@ -239,7 +252,7 @@ contract PhlimboTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT);
 
-        vm.prank(alice);
+        vm.prank(pauser);
         phlimbo.pause();
 
         vm.prank(alice);
@@ -248,7 +261,7 @@ contract PhlimboTest is Test {
     }
 
     function test_unpause_only_owner() public {
-        vm.prank(alice);
+        vm.prank(pauser);
         phlimbo.pause();
 
         vm.prank(bob);

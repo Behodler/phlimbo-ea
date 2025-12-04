@@ -6,7 +6,6 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@reflax-yield-vault/src/interfaces/IYieldStrategy.sol";
 import "@flax-token/src/IFlax.sol";
-import "./IEYE.sol";
 
 /**
  * @title PhlimboEA
@@ -28,8 +27,8 @@ contract PhlimboEA is Ownable, Pausable {
     /// @notice Minter address used for querying YieldStrategy principal
     address public minter;
 
-    /// @notice EYE token required for emergency pause mechanism
-    IERC20 public eye;
+    /// @notice Address authorized to pause the contract
+    address public pauser;
 
     /// @notice Desired APY in basis points (e.g., 500 = 5%)
     uint256 public desiredAPYBps;
@@ -56,9 +55,6 @@ contract PhlimboEA is Ownable, Pausable {
 
     /// @notice Seconds in a year for APY calculations
     uint256 public constant SECONDS_PER_YEAR = 365 days;
-
-    /// @notice Amount of EYE required to pause the contract
-    uint256 public constant PAUSE_EYE_COST = 1000 ether;
 
     // ========================== STRUCTS ==========================
 
@@ -87,20 +83,17 @@ contract PhlimboEA is Ownable, Pausable {
      * @param _phUSD Address of the phUSD token
      * @param _stable Address of the stable token for rewards
      * @param _minter Address used for querying YieldStrategy
-     * @param _eye Address of the EYE token for pause mechanism
      */
     constructor(
         address _yieldStrategy,
         address _phUSD,
         address _stable,
-        address _minter,
-        address _eye
+        address _minter
     ) Ownable(msg.sender) {
         yieldStrategy = IYieldStrategy(_yieldStrategy);
         phUSD = IFlax(_phUSD);
         stable = IERC20(_stable);
         minter = _minter;
-        eye = IERC20(_eye);
         lastRewardTime = block.timestamp;
     }
 
@@ -124,6 +117,14 @@ contract PhlimboEA is Ownable, Pausable {
     }
 
     /**
+     * @notice Sets the address authorized to pause the contract
+     * @param _pauser Address to authorize for pausing (can be zero address to disable pausing)
+     */
+    function setPauser(address _pauser) external onlyOwner {
+        pauser = _pauser;
+    }
+
+    /**
      * @notice Emergency function to transfer all tokens to a recipient
      * @param recipient Address to receive the tokens
      */
@@ -142,17 +143,11 @@ contract PhlimboEA is Ownable, Pausable {
     // ========================== PAUSE MECHANISM ==========================
 
     /**
-     * @notice Pauses the contract by burning EYE tokens
-     * @dev Requires caller to have 1000 EYE tokens which will be burned
+     * @notice Pauses the contract
+     * @dev Can only be called by the designated pauser address
      */
     function pause() public {
-        // Transfer EYE from caller
-        eye.transferFrom(msg.sender, address(this), PAUSE_EYE_COST);
-
-        // Burn the EYE tokens
-        IEYE(address(eye)).burn(PAUSE_EYE_COST);
-
-        // Pause the contract
+        require(msg.sender == pauser, "Only pauser can pause");
         _pause();
     }
 
