@@ -331,6 +331,34 @@ contract PhlimboEA is Ownable, Pausable {
     }
 
     /**
+     * @notice Returns pending stable rewards for a user including unharvested yield
+     * @param user Address to check
+     * @return Pending stable amount (including unharvested yield from strategy)
+     */
+    function pendingStableRealtime(address user) external view returns (uint256) {
+        UserInfo storage userDetails = userInfo[user];
+
+        if (totalStaked == 0 || userDetails.amount == 0) {
+            return 0;
+        }
+
+        // Start with current accStablePerShare
+        uint256 _accStablePerShare = accStablePerShare;
+
+        // Calculate unharvested yield in the strategy
+        uint256 totalBalance = yieldStrategy.totalBalanceOf(address(stable), minter);
+        uint256 principal = yieldStrategy.principalOf(address(stable), minter);
+
+        if (totalBalance > principal) {
+            uint256 unharvestedYield = totalBalance - principal;
+            // Add what this yield would contribute to accStablePerShare
+            _accStablePerShare += (unharvestedYield * PRECISION) / totalStaked;
+        }
+
+        return (userDetails.amount * _accStablePerShare) / PRECISION - userDetails.stableDebt;
+    }
+
+    /**
      * @notice Returns current pool information
      * @return _totalStaked Total staked amount
      * @return _accPhUSDPerShare Accumulated phUSD per share

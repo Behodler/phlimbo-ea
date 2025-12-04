@@ -465,4 +465,57 @@ contract PhlimboTest is Test {
         assertGe(phUSDPerSecond, 0, "Emission rate should be non-negative");
         assertGe(lastRewardTime, 0, "Last reward time should be non-negative");
     }
+
+    // ========================== REALTIME PENDING STABLE TESTS ==========================
+
+    function test_pendingStableRealtime_returns_same_as_pendingStable_when_no_unharvested_yield() public {
+        // Setup: No unharvested yield (principal equals total balance)
+        yieldStrategy.setPrincipal(address(stable), minter, 1000 ether);
+        yieldStrategy.setTotal(address(stable), minter, 1000 ether); // No yield
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        uint256 pendingStandard = phlimbo.pendingStable(alice);
+        uint256 pendingRealtime = phlimbo.pendingStableRealtime(alice);
+
+        assertEq(
+            pendingRealtime,
+            pendingStandard,
+            "pendingStableRealtime should equal pendingStable when no unharvested yield"
+        );
+    }
+
+    function test_pendingStableRealtime_returns_higher_value_than_pendingStable_with_unharvested_yield() public {
+        // Setup: Set principal and total in strategy with unharvested yield
+        yieldStrategy.setPrincipal(address(stable), minter, 1000 ether);
+        yieldStrategy.setTotal(address(stable), minter, 1100 ether); // 100 ether unharvested yield
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Wait a bit (though this doesn't trigger harvest)
+        vm.warp(block.timestamp + 1 days);
+
+        uint256 pendingStandard = phlimbo.pendingStable(alice);
+        uint256 pendingRealtime = phlimbo.pendingStableRealtime(alice);
+
+        assertGt(
+            pendingRealtime,
+            pendingStandard,
+            "pendingStableRealtime should be higher than pendingStable when unharvested yield exists"
+        );
+
+        // Verify the difference is approximately the unharvested yield
+        // Since Alice has 100% of totalStaked, she should get all the unharvested yield
+        uint256 expectedDifference = 100 ether;
+        uint256 actualDifference = pendingRealtime - pendingStandard;
+
+        assertApproxEqRel(
+            actualDifference,
+            expectedDifference,
+            0.01e18,
+            "Difference should equal unharvested yield"
+        );
+    }
 }
