@@ -499,4 +499,138 @@ contract PhlimboEMATest is Test {
 
         assertGt(phlimbo.smoothedStablePerSecond(), 0, "Should handle sequential same-block claims");
     }
+
+    // ========================== PHUSD EMISSION RATE TESTS ==========================
+
+    function test_emission_rate_calculates_correctly() public {
+        // Set desired APY to 8% (800 bps)
+        phlimbo.setDesiredAPY(800);
+
+        // Stake 200 phUSD
+        vm.prank(alice);
+        phlimbo.stake(200 ether);
+
+        // Expected: phUSDPerSecond = (200 * 800) / 10000 / 31536000
+        // = 160000 / 10000 / 31536000 = 16 / 31536000 ≈ 5.07e-7
+        uint256 SECONDS_PER_YEAR = 365 days;
+        uint256 expectedRate = (200 ether * 800) / 10000 / SECONDS_PER_YEAR;
+        uint256 actualRate = phlimbo.phUSDPerSecond();
+
+        assertEq(actualRate, expectedRate, "Emission rate should match formula");
+    }
+
+    function test_emission_rate_updates_on_stake_increase() public {
+        phlimbo.setDesiredAPY(800); // 8%
+
+        // Initial stake
+        vm.prank(alice);
+        phlimbo.stake(100 ether);
+        uint256 rateBefore = phlimbo.phUSDPerSecond();
+
+        // Additional stake increases total staked
+        vm.prank(bob);
+        phlimbo.stake(100 ether);
+        uint256 rateAfter = phlimbo.phUSDPerSecond();
+
+        // Rate should double (200 staked vs 100 staked)
+        assertGt(rateAfter, rateBefore, "Rate should increase");
+        assertEq(rateAfter, rateBefore * 2, "Rate should double with double stake");
+    }
+
+    function test_emission_rate_updates_on_withdraw_decrease() public {
+        phlimbo.setDesiredAPY(800); // 8%
+
+        // Initial stake
+        vm.prank(alice);
+        phlimbo.stake(200 ether);
+        uint256 rateBefore = phlimbo.phUSDPerSecond();
+
+        // Withdraw half
+        vm.prank(alice);
+        phlimbo.withdraw(100 ether);
+        uint256 rateAfter = phlimbo.phUSDPerSecond();
+
+        // Rate should halve
+        assertLt(rateAfter, rateBefore, "Rate should decrease");
+        assertEq(rateAfter, rateBefore / 2, "Rate should halve when stake halves");
+    }
+
+    function test_emission_rate_is_zero_when_no_stake() public {
+        phlimbo.setDesiredAPY(800); // 8%
+
+        // No one has staked yet
+        uint256 rate = phlimbo.phUSDPerSecond();
+        assertEq(rate, 0, "Emission rate should be 0 with no stakers");
+    }
+
+    function test_emission_rate_becomes_zero_after_full_withdraw() public {
+        phlimbo.setDesiredAPY(800); // 8%
+
+        // Stake
+        vm.prank(alice);
+        phlimbo.stake(100 ether);
+        assertGt(phlimbo.phUSDPerSecond(), 0, "Rate should be positive after staking");
+
+        // Full withdraw
+        vm.prank(alice);
+        phlimbo.withdraw(100 ether);
+        assertEq(phlimbo.phUSDPerSecond(), 0, "Rate should be 0 after full withdraw");
+    }
+
+    function test_setDesiredAPY_triggers_emission_rate_recalculation() public {
+        // Stake some tokens
+        vm.prank(alice);
+        phlimbo.stake(200 ether);
+
+        // Set APY to 8%
+        phlimbo.setDesiredAPY(800);
+        uint256 rateBefore = phlimbo.phUSDPerSecond();
+        assertGt(rateBefore, 0, "Rate should be positive");
+
+        // Change APY to 16% (double)
+        phlimbo.setDesiredAPY(1600);
+        uint256 rateAfter = phlimbo.phUSDPerSecond();
+
+        // Rate should double
+        assertEq(rateAfter, rateBefore * 2, "Rate should double when APY doubles");
+    }
+
+    function test_emission_rate_example_200_phUSD_8_percent_APY() public {
+        // Verify the example calculation from the story
+        phlimbo.setDesiredAPY(800); // 8% APY
+
+        vm.prank(alice);
+        phlimbo.stake(200 ether);
+
+        uint256 rate = phlimbo.phUSDPerSecond();
+
+        // Expected: (200 * 800 / 10000) / 31536000 = 16 / 31536000
+        uint256 SECONDS_PER_YEAR = 365 days;
+        uint256 expectedRate = (200 ether * 800) / 10000 / SECONDS_PER_YEAR;
+        assertEq(rate, expectedRate, "Should match example calculation");
+
+        // Verify annual yield by calculating total emissions over 1 year
+        uint256 annualEmissions = rate * SECONDS_PER_YEAR;
+        // Should be approximately 16 phUSD (200 * 0.08 = 16)
+        assertApproxEqRel(annualEmissions, 16 ether, 0.001e18, "Annual yield should be ~16 phUSD");
+    }
+
+    function test_phUSD_rewards_accrue_with_emission_rate() public {
+        // Set APY and stake
+        phlimbo.setDesiredAPY(800); // 8%
+        vm.prank(alice);
+        phlimbo.stake(200 ether);
+
+        // Wait 1 day
+        vm.warp(block.timestamp + 1 days);
+
+        // Check pending phUSD rewards
+        uint256 pending = phlimbo.pendingPhUSD(alice);
+
+        // Expected daily yield = annual yield / 365 = (200 * 0.08) / 365 ≈ 0.0438 phUSD
+        uint256 annualYield = (200 ether * 800) / 10000;
+        uint256 daysPerYear = 365;
+        uint256 expectedDaily = annualYield / daysPerYear;
+        assertApproxEqRel(pending, expectedDaily, 0.001e18, "Daily phUSD rewards should accrue");
+    }
 }

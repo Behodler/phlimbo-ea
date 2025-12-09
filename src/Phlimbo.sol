@@ -129,7 +129,7 @@ contract PhlimboEA is Ownable, Pausable {
     function setDesiredAPY(uint256 bps) external onlyOwner {
         _updatePool();
         desiredAPYBps = bps;
-        // Note: phUSD emission rate calculation removed - will be handled differently
+        _updatePhUSDEmissionRate();
     }
 
     /**
@@ -267,6 +267,9 @@ contract PhlimboEA is Ownable, Pausable {
 
         // Update total staked
         totalStaked += amount;
+
+        // Update phUSD emission rate based on new total staked
+        _updatePhUSDEmissionRate();
     }
 
     /**
@@ -292,6 +295,9 @@ contract PhlimboEA is Ownable, Pausable {
 
         // Transfer phUSD back to user
         phUSD.transfer(msg.sender, amount);
+
+        // Update phUSD emission rate based on new total staked
+        _updatePhUSDEmissionRate();
     }
 
     /**
@@ -379,6 +385,21 @@ contract PhlimboEA is Ownable, Pausable {
         if (pendingRewardAmount > 0) {
             rewardToken.transfer(user, pendingRewardAmount);
         }
+    }
+
+    /**
+     * @notice Updates phUSD emission rate based on total staked and desired APY
+     * @dev Formula: phUSDPerSecond = (totalStaked * desiredAPYBps) / 10000 / SECONDS_PER_YEAR
+     */
+    function _updatePhUSDEmissionRate() internal {
+        if (totalStaked == 0) {
+            phUSDPerSecond = 0;
+            return;
+        }
+
+        // Calculate phUSD emission rate
+        // phUSDPerSecond = (totalStaked * desiredAPYBps) / 10000 / SECONDS_PER_YEAR
+        phUSDPerSecond = (totalStaked * desiredAPYBps) / 10000 / SECONDS_PER_YEAR;
     }
 
     // ========================== VIEW FUNCTIONS ==========================
