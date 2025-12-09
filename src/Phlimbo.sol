@@ -5,13 +5,14 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "./IFlax.sol";
+import "./interfaces/IPhlimbo.sol";
 
 /**
  * @title PhlimboEA
  * @notice Staking yield farm for phUSD tokens with EMA-smoothed reward distribution
  * @dev Receives rewards from yield-accumulator contract and distributes them smoothly using EMA algorithm
  */
-contract PhlimboEA is Ownable, Pausable {
+contract PhlimboEA is Ownable, Pausable, IPhlimbo {
     // ========================== STATE VARIABLES ==========================
 
     /// @notice phUSD token - used for staking and rewards
