@@ -4,28 +4,24 @@ pragma solidity ^0.8.19;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@reflax-yield-vault/src/interfaces/IYieldStrategy.sol";
-import "@flax-token/src/IFlax.sol";
+import "./IFlax.sol";
 
 /**
  * @title PhlimboEA
- * @notice Staking yield farm for phUSD tokens with dynamic APY based on YieldStrategy performance
- * @dev Integrates with YieldStrategy for stable token yield and mints phUSD rewards based on APY targets
+ * @notice Staking yield farm for phUSD tokens with EMA-smoothed reward distribution
+ * @dev Receives rewards from yield-accumulator contract and distributes them smoothly using EMA algorithm
  */
 contract PhlimboEA is Ownable, Pausable {
     // ========================== STATE VARIABLES ==========================
 
-    /// @notice The yield strategy adapter for managing external vault deposits
-    IYieldStrategy public yieldStrategy;
-
     /// @notice phUSD token - used for staking and rewards
     IFlax public phUSD;
 
-    /// @notice External stablecoin token distributed as rewards
-    IERC20 public stable;
+    /// @notice External stablecoin token distributed as rewards (received from yield-accumulator)
+    IERC20 public rewardToken;
 
-    /// @notice Minter address used for querying YieldStrategy principal
-    address public minter;
+    /// @notice Address of the yield accumulator contract authorized to call collectReward
+    address public yieldAccumulator;
 
     /// @notice Address authorized to pause the contract
     address public pauser;
@@ -35,6 +31,15 @@ contract PhlimboEA is Ownable, Pausable {
 
     /// @notice Current phUSD emission rate per second
     uint256 public phUSDPerSecond;
+
+    /// @notice Timestamp of last reward collection from yield-accumulator
+    uint256 public lastClaimTimestamp;
+
+    /// @notice EMA-smoothed stable reward rate per second (scaled by PRECISION)
+    uint256 public smoothedStablePerSecond;
+
+    /// @notice EMA alpha parameter for smoothing (scaled by PRECISION, e.g., 0.1e18 = 10% weight on new rate)
+    uint256 public alpha;
 
     /// @notice Timestamp of last reward update
     uint256 public lastRewardTime;
@@ -75,26 +80,44 @@ contract PhlimboEA is Ownable, Pausable {
     /// @notice Mapping of user address to their staking information
     mapping(address => UserInfo) public userInfo;
 
+    // ========================== EVENTS ==========================
+
+    /// @notice Emitted when rewards are collected from yield-accumulator
+    event RewardCollected(uint256 amount, uint256 instantRate, uint256 newSmoothedRate);
+
+    /// @notice Emitted when yield accumulator address is updated
+    event YieldAccumulatorUpdated(address indexed oldAccumulator, address indexed newAccumulator);
+
+    /// @notice Emitted when alpha parameter is updated
+    event AlphaUpdated(uint256 oldAlpha, uint256 newAlpha);
+
     // ========================== CONSTRUCTOR ==========================
 
     /**
      * @notice Initializes the Phlimbo staking contract
-     * @param _yieldStrategy Address of the YieldStrategy contract
      * @param _phUSD Address of the phUSD token
-     * @param _stable Address of the stable token for rewards
-     * @param _minter Address used for querying YieldStrategy
+     * @param _rewardToken Address of the stable token for rewards (received from yield-accumulator)
+     * @param _yieldAccumulator Address of the yield accumulator contract
+     * @param _alpha EMA alpha parameter (scaled by 1e18, e.g., 0.1e18 = 10%)
      */
     constructor(
-        address _yieldStrategy,
         address _phUSD,
-        address _stable,
-        address _minter
+        address _rewardToken,
+        address _yieldAccumulator,
+        uint256 _alpha
     ) Ownable(msg.sender) {
-        yieldStrategy = IYieldStrategy(_yieldStrategy);
+        require(_phUSD != address(0), "Invalid phUSD address");
+        require(_rewardToken != address(0), "Invalid reward token address");
+        require(_yieldAccumulator != address(0), "Invalid yield accumulator address");
+        require(_alpha > 0 && _alpha <= PRECISION, "Alpha must be between 0 and 1e18");
+
         phUSD = IFlax(_phUSD);
-        stable = IERC20(_stable);
-        minter = _minter;
+        rewardToken = IERC20(_rewardToken);
+        yieldAccumulator = _yieldAccumulator;
+        alpha = _alpha;
         lastRewardTime = block.timestamp;
+        lastClaimTimestamp = block.timestamp;
+        smoothedStablePerSecond = 0; // Will converge after first few claims
     }
 
     // ========================== ADMIN FUNCTIONS ==========================
@@ -106,7 +129,29 @@ contract PhlimboEA is Ownable, Pausable {
     function setDesiredAPY(uint256 bps) external onlyOwner {
         _updatePool();
         desiredAPYBps = bps;
-        phUSDPerSecond = _calculatePhUSDPerSecond();
+        // Note: phUSD emission rate calculation removed - will be handled differently
+    }
+
+    /**
+     * @notice Sets the yield accumulator address
+     * @param _yieldAccumulator New yield accumulator address
+     */
+    function setYieldAccumulator(address _yieldAccumulator) external onlyOwner {
+        require(_yieldAccumulator != address(0), "Invalid address");
+        address oldAccumulator = yieldAccumulator;
+        yieldAccumulator = _yieldAccumulator;
+        emit YieldAccumulatorUpdated(oldAccumulator, _yieldAccumulator);
+    }
+
+    /**
+     * @notice Sets the EMA alpha parameter
+     * @param _alpha New alpha value (scaled by 1e18)
+     */
+    function setAlpha(uint256 _alpha) external onlyOwner {
+        require(_alpha > 0 && _alpha <= PRECISION, "Alpha must be between 0 and 1e18");
+        uint256 oldAlpha = alpha;
+        alpha = _alpha;
+        emit AlphaUpdated(oldAlpha, _alpha);
     }
 
     /**
@@ -130,13 +175,13 @@ contract PhlimboEA is Ownable, Pausable {
      */
     function emergencyTransfer(address recipient) external onlyOwner {
         uint256 phUSDBalance = phUSD.balanceOf(address(this));
-        uint256 stableBalance = stable.balanceOf(address(this));
+        uint256 rewardBalance = rewardToken.balanceOf(address(this));
 
         if (phUSDBalance > 0) {
             phUSD.transfer(recipient, phUSDBalance);
         }
-        if (stableBalance > 0) {
-            stable.transfer(recipient, stableBalance);
+        if (rewardBalance > 0) {
+            rewardToken.transfer(recipient, rewardBalance);
         }
     }
 
@@ -149,6 +194,51 @@ contract PhlimboEA is Ownable, Pausable {
     function pause() public {
         require(msg.sender == pauser, "Only pauser can pause");
         _pause();
+    }
+
+    // ========================== REWARD COLLECTION ==========================
+
+    /**
+     * @notice Collects rewards from yield-accumulator and updates EMA-smoothed rate
+     * @dev Can only be called by the yield accumulator contract
+     * @param amount Amount of reward tokens to collect
+     */
+    function collectReward(uint256 amount) external {
+        require(msg.sender == yieldAccumulator, "Only yield accumulator can call");
+        require(amount > 0, "Amount must be greater than 0");
+
+        // Pull tokens from yield-accumulator
+        rewardToken.transferFrom(msg.sender, address(this), amount);
+
+        // Calculate time delta since last claim
+        uint256 deltaTime = block.timestamp - lastClaimTimestamp;
+
+        // Handle edge case: same block claims (set deltaTime to 1 to avoid division by zero)
+        if (deltaTime == 0) {
+            deltaTime = 1;
+        }
+
+        // Calculate instant rate with 1e18 precision
+        uint256 instantRate = (amount * PRECISION) / deltaTime;
+
+        // Update smoothed rate using EMA formula
+        // smoothedStablePerSecond = (alpha * instantRate + (1e18 - alpha) * smoothedStablePerSecond) / 1e18
+        if (smoothedStablePerSecond == 0) {
+            // First claim - initialize with instant rate
+            smoothedStablePerSecond = instantRate;
+        } else {
+            uint256 alphaWeight = (alpha * instantRate) / PRECISION;
+            uint256 historyWeight = ((PRECISION - alpha) * smoothedStablePerSecond) / PRECISION;
+            smoothedStablePerSecond = alphaWeight + historyWeight;
+        }
+
+        // Update last claim timestamp
+        lastClaimTimestamp = block.timestamp;
+
+        // Update pool to accrue rewards based on new rate
+        _updatePool();
+
+        emit RewardCollected(amount, instantRate, smoothedStablePerSecond);
     }
 
     // ========================== CORE STAKING FUNCTIONS ==========================
@@ -219,7 +309,8 @@ contract PhlimboEA is Ownable, Pausable {
     // ========================== INTERNAL FUNCTIONS ==========================
 
     /**
-     * @notice Updates pool accumulators and emission rate
+     * @notice Updates pool accumulators based on EMA-smoothed reward rate
+     * @dev Accrues stable rewards based on smoothedStablePerSecond, capped by actual pot balance
      */
     function _updatePool() internal {
         if (block.timestamp <= lastRewardTime) {
@@ -231,49 +322,39 @@ contract PhlimboEA is Ownable, Pausable {
             return;
         }
 
-        // Harvest stable yield from YieldStrategy
-        _harvestStable();
-
-        // Calculate time elapsed
+        // Calculate time elapsed since last update
         uint256 timeElapsed = block.timestamp - lastRewardTime;
 
-        // Update phUSD rewards
-        uint256 phUSDReward = timeElapsed * phUSDPerSecond;
-        accPhUSDPerShare += (phUSDReward * PRECISION) / totalStaked;
+        // Calculate potential stable reward based on smoothed rate
+        uint256 potentialReward = (smoothedStablePerSecond * timeElapsed) / PRECISION;
 
-        // Recalculate emission rate based on current YieldStrategy state
-        phUSDPerSecond = _calculatePhUSDPerSecond();
+        // Get current pot balance (reward tokens in contract)
+        uint256 potBalance = rewardToken.balanceOf(address(this));
 
-        lastRewardTime = block.timestamp;
-    }
-
-    /**
-     * @notice Harvests stable yield from YieldStrategy
-     */
-    function _harvestStable() internal {
-        uint256 totalBalance = yieldStrategy.totalBalanceOf(address(stable), minter);
-        uint256 principal = yieldStrategy.principalOf(address(stable), minter);
-
-        if (totalBalance > principal) {
-            uint256 yieldAmount = totalBalance - principal;
-            yieldStrategy.withdrawFrom(address(stable), minter, yieldAmount, address(this));
-
-            if (totalStaked > 0) {
-                accStablePerShare += (yieldAmount * PRECISION) / totalStaked;
+        // If rewardToken is the same as phUSD (staked token), subtract staked amount
+        if (address(rewardToken) == address(phUSD)) {
+            if (potBalance > totalStaked) {
+                potBalance -= totalStaked;
+            } else {
+                potBalance = 0;
             }
         }
-    }
 
-    /**
-     * @notice Calculates phUSD emission rate based on APY and total principal
-     * @return Emission rate in phUSD per second
-     */
-    function _calculatePhUSDPerSecond() internal view returns (uint256) {
-        uint256 totalPrincipal = yieldStrategy.totalBalanceOf(address(stable), minter);
-        if (totalPrincipal == 0) {
-            return 0;
+        // Cap distribution by actual pot balance to prevent over-distribution
+        uint256 toDistribute = potentialReward > potBalance ? potBalance : potentialReward;
+
+        // Update accumulated stable per share
+        if (toDistribute > 0) {
+            accStablePerShare += (toDistribute * PRECISION) / totalStaked;
         }
-        return (totalPrincipal * desiredAPYBps) / 10000 / SECONDS_PER_YEAR;
+
+        // Update phUSD rewards (if phUSDPerSecond is set)
+        if (phUSDPerSecond > 0) {
+            uint256 phUSDReward = timeElapsed * phUSDPerSecond;
+            accPhUSDPerShare += (phUSDReward * PRECISION) / totalStaked;
+        }
+
+        lastRewardTime = block.timestamp;
     }
 
     /**
@@ -293,10 +374,10 @@ contract PhlimboEA is Ownable, Pausable {
             phUSD.mint(user, pendingPhUSDAmount);
         }
 
-        // Calculate pending stable
-        uint256 pendingStableAmount = (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;
-        if (pendingStableAmount > 0) {
-            stable.transfer(user, pendingStableAmount);
+        // Calculate pending reward tokens (stable)
+        uint256 pendingRewardAmount = (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;
+        if (pendingRewardAmount > 0) {
+            rewardToken.transfer(user, pendingRewardAmount);
         }
     }
 
@@ -328,34 +409,6 @@ contract PhlimboEA is Ownable, Pausable {
     function pendingStable(address user) external view returns (uint256) {
         UserInfo storage userDetails = userInfo[user];
         return (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;
-    }
-
-    /**
-     * @notice Returns pending stable rewards for a user including unharvested yield
-     * @param user Address to check
-     * @return Pending stable amount (including unharvested yield from strategy)
-     */
-    function pendingStableRealtime(address user) external view returns (uint256) {
-        UserInfo storage userDetails = userInfo[user];
-
-        if (totalStaked == 0 || userDetails.amount == 0) {
-            return 0;
-        }
-
-        // Start with current accStablePerShare
-        uint256 _accStablePerShare = accStablePerShare;
-
-        // Calculate unharvested yield in the strategy
-        uint256 totalBalance = yieldStrategy.totalBalanceOf(address(stable), minter);
-        uint256 principal = yieldStrategy.principalOf(address(stable), minter);
-
-        if (totalBalance > principal) {
-            uint256 unharvestedYield = totalBalance - principal;
-            // Add what this yield would contribute to accStablePerShare
-            _accStablePerShare += (unharvestedYield * PRECISION) / totalStaked;
-        }
-
-        return (userDetails.amount * _accStablePerShare) / PRECISION - userDetails.stableDebt;
     }
 
     /**
