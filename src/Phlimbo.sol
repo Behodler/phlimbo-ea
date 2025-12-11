@@ -4,6 +4,7 @@ pragma solidity ^0.8.19;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./IFlax.sol";
 import "./interfaces/IPhlimbo.sol";
 
@@ -13,6 +14,8 @@ import "./interfaces/IPhlimbo.sol";
  * @dev Receives rewards from yield-accumulator contract and distributes them smoothly using EMA algorithm
  */
 contract PhlimboEA is Ownable, Pausable, IPhlimbo {
+    using SafeERC20 for IERC20;
+
     // ========================== STATE VARIABLES ==========================
 
     /// @notice phUSD token - used for staking and rewards
@@ -179,10 +182,10 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
         uint256 rewardBalance = rewardToken.balanceOf(address(this));
 
         if (phUSDBalance > 0) {
-            phUSD.transfer(recipient, phUSDBalance);
+            IERC20(address(phUSD)).safeTransfer(recipient, phUSDBalance);
         }
         if (rewardBalance > 0) {
-            rewardToken.transfer(recipient, rewardBalance);
+            rewardToken.safeTransfer(recipient, rewardBalance);
         }
     }
 
@@ -209,7 +212,7 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
         require(amount > 0, "Amount must be greater than 0");
 
         // Pull tokens from yield-accumulator
-        rewardToken.transferFrom(msg.sender, address(this), amount);
+        rewardToken.safeTransferFrom(msg.sender, address(this), amount);
 
         // Calculate time delta since last claim
         uint256 deltaTime = block.timestamp - lastClaimTimestamp;
@@ -259,7 +262,7 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
         }
 
         // Transfer phUSD from user
-        phUSD.transferFrom(msg.sender, address(this), amount);
+        IERC20(address(phUSD)).safeTransferFrom(msg.sender, address(this), amount);
 
         // Update user info
         user.amount += amount;
@@ -295,7 +298,7 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
         totalStaked -= amount;
 
         // Transfer phUSD back to user
-        phUSD.transfer(msg.sender, amount);
+        IERC20(address(phUSD)).safeTransfer(msg.sender, amount);
 
         // Update phUSD emission rate based on new total staked
         _updatePhUSDEmissionRate();
@@ -384,7 +387,7 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
         // Calculate pending reward tokens (stable)
         uint256 pendingRewardAmount = (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;
         if (pendingRewardAmount > 0) {
-            rewardToken.transfer(user, pendingRewardAmount);
+            rewardToken.safeTransfer(user, pendingRewardAmount);
         }
     }
 
