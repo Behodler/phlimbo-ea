@@ -65,6 +65,9 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
     /// @notice Seconds in a year for APY calculations
     uint256 public constant SECONDS_PER_YEAR = 365 days;
 
+    /// @notice Minimum stake amount to prevent first depositor attack (0.001 phUSD)
+    uint256 public constant MINIMUM_STAKE = 1e15;
+
     // ========================== STRUCTS ==========================
 
     /**
@@ -252,6 +255,8 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
      * @param amount Amount of phUSD to stake
      */
     function stake(uint256 amount) external whenNotPaused {
+        require(amount >= MINIMUM_STAKE, "Below minimum stake");
+
         _updatePool();
 
         UserInfo storage user = userInfo[msg.sender];
@@ -286,19 +291,29 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
 
         _updatePool();
 
-        // Claim pending rewards
+        // Claim pending rewards (uses original user.amount before adjustment)
         _claimRewards(msg.sender);
 
+        // Calculate remaining balance after withdrawal
+        uint256 remaining = user.amount - amount;
+
+        // Prevent dust: if remaining would be > 0 but < MINIMUM_STAKE, force full withdrawal
+        uint256 actualWithdrawAmount = amount;
+        if (remaining > 0 && remaining < MINIMUM_STAKE) {
+            actualWithdrawAmount = user.amount;
+            remaining = 0;
+        }
+
         // Update user info
-        user.amount -= amount;
+        user.amount = remaining;
         user.phUSDDebt = (user.amount * accPhUSDPerShare) / PRECISION;
         user.stableDebt = (user.amount * accStablePerShare) / PRECISION;
 
         // Update total staked
-        totalStaked -= amount;
+        totalStaked -= actualWithdrawAmount;
 
         // Transfer phUSD back to user
-        IERC20(address(phUSD)).safeTransfer(msg.sender, amount);
+        IERC20(address(phUSD)).safeTransfer(msg.sender, actualWithdrawAmount);
 
         // Update phUSD emission rate based on new total staked
         _updatePhUSDEmissionRate();

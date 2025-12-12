@@ -633,4 +633,148 @@ contract PhlimboEMATest is Test {
         uint256 expectedDaily = annualYield / daysPerYear;
         assertApproxEqRel(pending, expectedDaily, 0.001e18, "Daily phUSD rewards should accrue");
     }
+
+    // ========================== SECURITY TESTS - FIRST DEPOSITOR ATTACK MITIGATION ==========================
+
+    function test_stake_below_minimum_reverts() public {
+        uint256 belowMinimum = phlimbo.MINIMUM_STAKE() - 1;
+
+        vm.prank(alice);
+        vm.expectRevert("Below minimum stake");
+        phlimbo.stake(belowMinimum);
+    }
+
+    function test_stake_at_minimum_succeeds() public {
+        uint256 minimum = phlimbo.MINIMUM_STAKE();
+
+        vm.prank(alice);
+        phlimbo.stake(minimum);
+
+        (uint256 amount,,) = phlimbo.userInfo(alice);
+        assertEq(amount, minimum, "Should stake exactly at minimum");
+    }
+
+    function test_withdraw_leaving_dust_withdraws_all() public {
+        uint256 stakeAmount = 10 ether;
+        vm.prank(alice);
+        phlimbo.stake(stakeAmount);
+
+        // Try to withdraw leaving dust (500 wei < MINIMUM_STAKE)
+        uint256 attemptedWithdraw = stakeAmount - 500;
+        uint256 balanceBefore = phUSD.balanceOf(alice);
+
+        vm.prank(alice);
+        phlimbo.withdraw(attemptedWithdraw);
+
+        // Should have withdrawn everything, not just the attempted amount
+        uint256 balanceAfter = phUSD.balanceOf(alice);
+        assertEq(balanceAfter - balanceBefore, stakeAmount, "Should withdraw full amount when dust would remain");
+
+        // User balance should be zero
+        (uint256 remaining,,) = phlimbo.userInfo(alice);
+        assertEq(remaining, 0, "User balance should be zero");
+    }
+
+    function test_withdraw_above_minimum_remaining_works() public {
+        uint256 stakeAmount = 100 ether;
+        vm.prank(alice);
+        phlimbo.stake(stakeAmount);
+
+        // Withdraw amount that leaves >= MINIMUM_STAKE
+        uint256 withdrawAmount = 50 ether;
+        uint256 balanceBefore = phUSD.balanceOf(alice);
+
+        vm.prank(alice);
+        phlimbo.withdraw(withdrawAmount);
+
+        // Should withdraw exactly the requested amount
+        uint256 balanceAfter = phUSD.balanceOf(alice);
+        assertEq(balanceAfter - balanceBefore, withdrawAmount, "Should withdraw exact amount");
+
+        // User balance should be the remainder
+        (uint256 remaining,,) = phlimbo.userInfo(alice);
+        assertEq(remaining, stakeAmount - withdrawAmount, "User balance should be remainder");
+    }
+
+    function test_first_depositor_attack_mitigated() public {
+        // This test demonstrates that the MINIMUM_STAKE requirement prevents
+        // the worst-case first depositor attack where an attacker with 1 wei
+        // could steal all rewards from legitimate stakers.
+        //
+        // With the mitigation:
+        // - Attacker must stake at least MINIMUM_STAKE (1e15 = 0.001 phUSD)
+        // - Attacker cannot reduce stake below MINIMUM_STAKE via withdrawal
+        // - This ensures a reasonable minimum denominator in share calculations
+
+        // Attacker stakes minimum (can't stake less due to minimum check)
+        uint256 attackerStake = phlimbo.MINIMUM_STAKE();
+        vm.prank(alice); // alice is the attacker
+        phlimbo.stake(attackerStake);
+
+        // Large reward comes in while attacker is sole staker
+        uint256 largeReward = 1000 ether;
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(largeReward);
+
+        // Wait for rewards to accrue
+        vm.warp(block.timestamp + 100);
+
+        // Legitimate user stakes a much larger amount
+        uint256 legitimateStake = 1000 ether;
+        vm.prank(bob);
+        phlimbo.stake(legitimateStake);
+
+        // Additional reward comes in after legitimate user joins
+        vm.warp(block.timestamp + 100);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(1000 ether);
+
+        // Wait more time for rewards to accrue
+        vm.warp(block.timestamp + 100);
+
+        // Check rewards
+        uint256 attackerRewards = phlimbo.pendingStable(alice);
+        uint256 legitimateRewards = phlimbo.pendingStable(bob);
+
+        // Both should have some rewards
+        assertGt(attackerRewards, 0, "Attacker should have some rewards");
+        assertGt(legitimateRewards, 0, "Legitimate user should have rewards");
+
+        // The key test: legitimate user should get substantial rewards
+        // Despite attacker being first depositor, the legitimate user with
+        // 1,000,000x more stake should get meaningful rewards
+        //
+        // If attack succeeded completely, legitimateRewards would be near 0
+        // and attacker would get ~2000 ether
+        //
+        // With mitigation, we expect legitimate user to get significant share
+        assertGt(legitimateRewards, 100 ether, "Legitimate user should get substantial rewards");
+
+        // Attacker shouldn't get everything - most rewards should go to legitimate staker
+        assertLt(attackerRewards, legitimateRewards, "Legitimate staker should get more than attacker");
+    }
+
+    function test_cannot_circumvent_minimum_by_withdraw_to_dust() public {
+        // Ensure attacker cannot:
+        // 1. Stake minimum
+        // 2. Withdraw to leave < minimum (which would be prevented)
+
+        uint256 stakeAmount = phlimbo.MINIMUM_STAKE() + 100;
+        vm.prank(alice);
+        phlimbo.stake(stakeAmount);
+
+        // Try to withdraw most of it, leaving less than minimum
+        uint256 attemptWithdraw = 101; // Would leave MINIMUM_STAKE - 1
+        uint256 balanceBefore = phUSD.balanceOf(alice);
+
+        vm.prank(alice);
+        phlimbo.withdraw(attemptWithdraw);
+
+        // Should have withdrawn everything due to dust prevention
+        uint256 balanceAfter = phUSD.balanceOf(alice);
+        assertEq(balanceAfter - balanceBefore, stakeAmount, "Should force full withdrawal");
+
+        (uint256 remaining,,) = phlimbo.userInfo(alice);
+        assertEq(remaining, 0, "No dust should remain");
+    }
 }
