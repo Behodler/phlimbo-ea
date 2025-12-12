@@ -123,7 +123,7 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
         yieldAccumulator = _yieldAccumulator;
         alpha = _alpha;
         lastRewardTime = block.timestamp;
-        lastClaimTimestamp = block.timestamp;
+        lastClaimTimestamp = 0; // Initialize to 0 to allow first claim
         smoothedStablePerSecond = 0; // Will converge after first few claims
     }
 
@@ -213,17 +213,13 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
     function collectReward(uint256 amount) external {
         require(msg.sender == yieldAccumulator, "Only yield accumulator can call");
         require(amount > 0, "Amount must be greater than 0");
+        require(block.timestamp > lastClaimTimestamp, "Cannot claim in same block");
 
         // Pull tokens from yield-accumulator
         rewardToken.safeTransferFrom(msg.sender, address(this), amount);
 
         // Calculate time delta since last claim
         uint256 deltaTime = block.timestamp - lastClaimTimestamp;
-
-        // Handle edge case: same block claims (set deltaTime to 1 to avoid division by zero)
-        if (deltaTime == 0) {
-            deltaTime = 1;
-        }
 
         // Calculate instant rate with 1e18 precision
         uint256 instantRate = (amount * PRECISION) / deltaTime;

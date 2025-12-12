@@ -173,8 +173,11 @@ contract PhlimboEMATest is Test {
         phlimbo.collectReward(rewardAmount);
 
         // First claim should initialize smoothedStablePerSecond to instantRate
-        // instantRate = (100 ether * 1e18) / 10 = 10 ether per second (in 1e18 precision)
-        uint256 expectedRate = (rewardAmount * 1e18) / 10;
+        // With lastClaimTimestamp = 0, deltaTime = current block.timestamp
+        // Foundry starts at timestamp 1, so after warp +10, timestamp = 11
+        // instantRate = (100 ether * 1e18) / 11
+        uint256 actualTimestamp = block.timestamp;
+        uint256 expectedRate = (rewardAmount * 1e18) / actualTimestamp;
         assertEq(phlimbo.smoothedStablePerSecond(), expectedRate, "Should initialize to instant rate");
     }
 
@@ -201,13 +204,31 @@ contract PhlimboEMATest is Test {
         assertLt(secondRate, instantRate, "Should not jump immediately to instant rate (EMA smoothing)");
     }
 
-    function test_collectReward_handles_same_block_claims() public {
-        // Two claims in same block (deltaTime = 0, should be set to 1)
+    function test_collectReward_reverts_on_same_block_claim() public {
+        // First claim in the block
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(100 ether);
 
-        // Verify it doesn't revert and handles deltaTime = 0 case
-        assertGt(phlimbo.smoothedStablePerSecond(), 0, "Should handle same block claim");
+        // Second claim in same block should revert
+        vm.prank(address(yieldAccumulator));
+        vm.expectRevert("Cannot claim in same block");
+        phlimbo.collectReward(100 ether);
+    }
+
+    function test_collectReward_succeeds_in_different_blocks() public {
+        // First claim
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(100 ether);
+
+        // Advance to next block
+        vm.warp(block.timestamp + 1);
+
+        // Second claim in different block should succeed
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(100 ether);
+
+        // Should have updated the smoothed rate
+        assertGt(phlimbo.smoothedStablePerSecond(), 0, "Should succeed in different blocks");
     }
 
     function test_collectReward_emits_event() public {
@@ -486,18 +507,20 @@ contract PhlimboEMATest is Test {
         assertGe(rewardToken.balanceOf(address(phlimbo)), 0, "Should handle large time gap");
     }
 
-    function test_multiple_sequential_claims_same_block() public {
-        // Multiple claims in same block should all work (deltaTime = 1 each)
+    function test_multiple_sequential_claims_different_blocks() public {
+        // Multiple claims in different blocks should all work
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(10 ether);
 
+        vm.warp(block.timestamp + 1);
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(20 ether);
 
+        vm.warp(block.timestamp + 1);
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(30 ether);
 
-        assertGt(phlimbo.smoothedStablePerSecond(), 0, "Should handle sequential same-block claims");
+        assertGt(phlimbo.smoothedStablePerSecond(), 0, "Should handle sequential claims in different blocks");
     }
 
     // ========================== PHUSD EMISSION RATE TESTS ==========================
