@@ -36,6 +36,16 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
     /// @notice Current phUSD emission rate per second
     uint256 public phUSDPerSecond;
 
+    // Two-step APY setting state
+    /// @notice Proposed APY value awaiting confirmation
+    uint256 public pendingAPYBps;
+
+    /// @notice Block when APY was proposed
+    uint256 public pendingAPYBlockNumber;
+
+    /// @notice Whether a set operation is pending confirmation
+    bool public apySetInProgress;
+
     /// @notice Timestamp of last reward collection from yield-accumulator
     uint256 public lastClaimTimestamp;
 
@@ -98,6 +108,12 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
     /// @notice Emitted when alpha parameter is updated
     event AlphaUpdated(uint256 oldAlpha, uint256 newAlpha);
 
+    /// @notice Emitted when an APY change is proposed (preview step)
+    event IntendedSetAPY(uint256 indexed proposedAPY, uint256 blockNumber, address indexed proposer);
+
+    /// @notice Emitted when an APY change is confirmed (commit step)
+    event DesiredAPYUpdated(uint256 oldAPY, uint256 newAPY);
+
     // ========================== CONSTRUCTOR ==========================
 
     /**
@@ -130,13 +146,33 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
     // ========================== ADMIN FUNCTIONS ==========================
 
     /**
-     * @notice Updates the desired APY and recalculates emission rate
+     * @notice Two-step APY setting: preview then commit
+     * @dev First call (preview): Emits IntendedSetAPY, stores pending state, no actual change
+     *      Second call (commit): If same value within 100 blocks, updates actual APY
+     *      Different value or >100 blocks: Resets to preview mode
      * @param bps New APY in basis points
      */
     function setDesiredAPY(uint256 bps) external onlyOwner {
-        _updatePool();
-        desiredAPYBps = bps;
-        _updatePhUSDEmissionRate();
+        // Check if we should treat this as a preview or commit
+        bool isPreview = !apySetInProgress ||
+                        block.number > pendingAPYBlockNumber + 100 ||
+                        bps != pendingAPYBps;
+
+        if (isPreview) {
+            // PREVIEW BRANCH: Emit intent, store pending state, no actual change
+            emit IntendedSetAPY(bps, block.number, msg.sender);
+            pendingAPYBps = bps;
+            pendingAPYBlockNumber = block.number;
+            apySetInProgress = true;
+        } else {
+            // COMMIT BRANCH: Update actual APY, emit confirmation, reset state
+            _updatePool();
+            uint256 oldAPY = desiredAPYBps;
+            desiredAPYBps = bps;
+            _updatePhUSDEmissionRate();
+            emit DesiredAPYUpdated(oldAPY, bps);
+            apySetInProgress = false;
+        }
     }
 
     /**
@@ -511,6 +547,24 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
             accStablePerShare,
             phUSDPerSecond,
             lastRewardTime
+        );
+    }
+
+    /**
+     * @notice Returns information about pending APY setting operation
+     * @return _pendingAPYBps The proposed APY value
+     * @return _pendingAPYBlockNumber The block when APY was proposed
+     * @return _apySetInProgress Whether a set operation is pending
+     */
+    function getPendingAPYInfo() external view returns (
+        uint256 _pendingAPYBps,
+        uint256 _pendingAPYBlockNumber,
+        bool _apySetInProgress
+    ) {
+        return (
+            pendingAPYBps,
+            pendingAPYBlockNumber,
+            apySetInProgress
         );
     }
 }

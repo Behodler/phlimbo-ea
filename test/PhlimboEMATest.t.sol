@@ -15,6 +15,8 @@ contract PhlimboEMATest is Test {
     event YieldAccumulatorUpdated(address indexed oldAccumulator, address indexed newAccumulator);
     event AlphaUpdated(uint256 oldAlpha, uint256 newAlpha);
     event EmergencyWithdrawal(address indexed user, uint256 amount);
+    event IntendedSetAPY(uint256 indexed proposedAPY, uint256 blockNumber, address indexed proposer);
+    event DesiredAPYUpdated(uint256 oldAPY, uint256 newAPY);
     PhlimboEA public phlimbo;
     MockFlax public phUSD;
     MockStable public rewardToken;
@@ -874,7 +876,9 @@ contract PhlimboEMATest is Test {
     // ========================== PHUSD EMISSION RATE TESTS ==========================
 
     function test_emission_rate_calculates_correctly() public {
-        // Set desired APY to 8% (800 bps)
+        // Set desired APY to 8% (800 bps) - two-step process
+        phlimbo.setDesiredAPY(800);
+        vm.roll(block.number + 1);
         phlimbo.setDesiredAPY(800);
 
         // Stake 200 phUSD
@@ -892,6 +896,8 @@ contract PhlimboEMATest is Test {
 
     function test_emission_rate_updates_on_stake_increase() public {
         phlimbo.setDesiredAPY(800); // 8%
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(800);
 
         // Initial stake
         vm.prank(alice);
@@ -910,6 +916,8 @@ contract PhlimboEMATest is Test {
 
     function test_emission_rate_updates_on_withdraw_decrease() public {
         phlimbo.setDesiredAPY(800); // 8%
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(800);
 
         // Initial stake
         vm.prank(alice);
@@ -928,6 +936,8 @@ contract PhlimboEMATest is Test {
 
     function test_emission_rate_is_zero_when_no_stake() public {
         phlimbo.setDesiredAPY(800); // 8%
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(800);
 
         // No one has staked yet
         uint256 rate = phlimbo.phUSDPerSecond();
@@ -936,6 +946,8 @@ contract PhlimboEMATest is Test {
 
     function test_emission_rate_becomes_zero_after_full_withdraw() public {
         phlimbo.setDesiredAPY(800); // 8%
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(800);
 
         // Stake
         vm.prank(alice);
@@ -955,10 +967,15 @@ contract PhlimboEMATest is Test {
 
         // Set APY to 8%
         phlimbo.setDesiredAPY(800);
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(800);
         uint256 rateBefore = phlimbo.phUSDPerSecond();
         assertGt(rateBefore, 0, "Rate should be positive");
 
         // Change APY to 16% (double)
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(1600);
+        vm.roll(block.number + 1);
         phlimbo.setDesiredAPY(1600);
         uint256 rateAfter = phlimbo.phUSDPerSecond();
 
@@ -969,6 +986,8 @@ contract PhlimboEMATest is Test {
     function test_emission_rate_example_200_phUSD_8_percent_APY() public {
         // Verify the example calculation from the story
         phlimbo.setDesiredAPY(800); // 8% APY
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(800);
 
         vm.prank(alice);
         phlimbo.stake(200 ether);
@@ -989,6 +1008,8 @@ contract PhlimboEMATest is Test {
     function test_phUSD_rewards_accrue_with_emission_rate() public {
         // Set APY and stake
         phlimbo.setDesiredAPY(800); // 8%
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(800);
         vm.prank(alice);
         phlimbo.stake(200 ether);
 
@@ -1237,5 +1258,278 @@ contract PhlimboEMATest is Test {
 
         // Projected amount should match actual received amount
         assertApproxEqRel(actualReceived, projectedPending, 0.001e18, "Projected should match actual rewards");
+    }
+
+    // ========================== TWO-STEP APY SETTING TESTS ==========================
+
+    function test_first_setDesiredAPY_call_emits_IntendedSetAPY() public {
+        uint256 newAPY = 800; // 8%
+
+        // Expect IntendedSetAPY event
+        vm.expectEmit(true, true, false, true);
+        emit IntendedSetAPY(newAPY, block.number, owner);
+
+        phlimbo.setDesiredAPY(newAPY);
+    }
+
+    function test_first_setDesiredAPY_call_does_not_change_actual_APY() public {
+        uint256 initialAPY = phlimbo.desiredAPYBps();
+        uint256 newAPY = 800; // 8%
+
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Actual APY should not change on first call
+        assertEq(phlimbo.desiredAPYBps(), initialAPY, "First call should not change actual APY");
+    }
+
+    function test_first_setDesiredAPY_call_sets_pending_state() public {
+        uint256 newAPY = 800; // 8%
+
+        phlimbo.setDesiredAPY(newAPY);
+
+        (uint256 pendingAPY, uint256 pendingBlock, bool inProgress) = phlimbo.getPendingAPYInfo();
+        assertEq(pendingAPY, newAPY, "Should set pending APY");
+        assertEq(pendingBlock, block.number, "Should set pending block number");
+        assertTrue(inProgress, "Should mark operation as in progress");
+    }
+
+    function test_second_setDesiredAPY_call_with_same_value_commits_APY() public {
+        uint256 newAPY = 800; // 8%
+
+        // First call (preview)
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Move to next block
+        vm.roll(block.number + 1);
+
+        // Second call (commit)
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Actual APY should now be updated
+        assertEq(phlimbo.desiredAPYBps(), newAPY, "Second call should commit APY change");
+    }
+
+    function test_second_setDesiredAPY_call_emits_DesiredAPYUpdated() public {
+        uint256 oldAPY = phlimbo.desiredAPYBps();
+        uint256 newAPY = 800; // 8%
+
+        // First call (preview)
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Move to next block
+        vm.roll(block.number + 1);
+
+        // Expect DesiredAPYUpdated event on second call
+        vm.expectEmit(false, false, false, true);
+        emit DesiredAPYUpdated(oldAPY, newAPY);
+
+        // Second call (commit)
+        phlimbo.setDesiredAPY(newAPY);
+    }
+
+    function test_second_setDesiredAPY_call_resets_pending_state() public {
+        uint256 newAPY = 800; // 8%
+
+        // First call (preview)
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Move to next block
+        vm.roll(block.number + 1);
+
+        // Second call (commit)
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Pending state should be reset
+        (,, bool inProgress) = phlimbo.getPendingAPYInfo();
+        assertFalse(inProgress, "Should reset in progress flag after commit");
+    }
+
+    function test_setDesiredAPY_with_different_value_resets_to_preview() public {
+        uint256 firstAPY = 800; // 8%
+        uint256 secondAPY = 1000; // 10%
+
+        // First call
+        phlimbo.setDesiredAPY(firstAPY);
+
+        // Move to next block
+        vm.roll(block.number + 1);
+
+        // Second call with different value should trigger new preview
+        vm.expectEmit(true, true, false, true);
+        emit IntendedSetAPY(secondAPY, block.number, owner);
+
+        phlimbo.setDesiredAPY(secondAPY);
+
+        // APY should still not be changed (new preview)
+        assertEq(phlimbo.desiredAPYBps(), 0, "Should not commit when value changes");
+
+        // Pending state should reflect new value
+        (uint256 pendingAPY,,) = phlimbo.getPendingAPYInfo();
+        assertEq(pendingAPY, secondAPY, "Should update pending APY to new value");
+    }
+
+    function test_setDesiredAPY_after_100_blocks_resets_to_preview() public {
+        uint256 newAPY = 800; // 8%
+
+        // First call
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Move past 100 blocks
+        vm.roll(block.number + 101);
+
+        // Call with same value should trigger new preview (stale)
+        vm.expectEmit(true, true, false, true);
+        emit IntendedSetAPY(newAPY, block.number, owner);
+
+        phlimbo.setDesiredAPY(newAPY);
+
+        // APY should still not be changed (new preview due to staleness)
+        assertEq(phlimbo.desiredAPYBps(), 0, "Should not commit after 100+ blocks");
+    }
+
+    function test_setDesiredAPY_cannot_be_stuck() public {
+        // Test that contract can never enter a state where APY cannot be set
+        uint256 firstAPY = 800;
+        uint256 secondAPY = 1000;
+        uint256 thirdAPY = 1200;
+
+        // First attempt
+        phlimbo.setDesiredAPY(firstAPY);
+
+        // Change mind with different value
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(secondAPY);
+
+        // Wait long time
+        vm.roll(block.number + 150);
+
+        // Try yet another value
+        phlimbo.setDesiredAPY(thirdAPY);
+
+        // Should still be able to commit
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(thirdAPY);
+
+        // Should successfully commit
+        assertEq(phlimbo.desiredAPYBps(), thirdAPY, "Contract should never be stuck");
+    }
+
+    function test_setDesiredAPY_multiple_preview_commit_cycles() public {
+        // Test that multiple cycles work correctly
+        uint256 firstAPY = 800;
+        uint256 secondAPY = 1000;
+
+        // First cycle: preview then commit
+        phlimbo.setDesiredAPY(firstAPY);
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(firstAPY);
+        assertEq(phlimbo.desiredAPYBps(), firstAPY, "First cycle should commit");
+
+        // Second cycle: preview then commit
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(secondAPY);
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(secondAPY);
+        assertEq(phlimbo.desiredAPYBps(), secondAPY, "Second cycle should commit");
+    }
+
+    function test_setDesiredAPY_within_100_blocks_commits() public {
+        uint256 newAPY = 800;
+
+        // Preview
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Commit at block 99 (just within deadline)
+        vm.roll(block.number + 99);
+        phlimbo.setDesiredAPY(newAPY);
+
+        assertEq(phlimbo.desiredAPYBps(), newAPY, "Should commit within 100 blocks");
+    }
+
+    function test_setDesiredAPY_at_block_100_commits() public {
+        uint256 newAPY = 800;
+
+        // Preview
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Commit at exactly block 100
+        vm.roll(block.number + 100);
+        phlimbo.setDesiredAPY(newAPY);
+
+        assertEq(phlimbo.desiredAPYBps(), newAPY, "Should commit at exactly 100 blocks");
+    }
+
+    function test_setDesiredAPY_at_block_101_does_not_commit() public {
+        uint256 newAPY = 800;
+
+        // Preview
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Try to commit at block 101 (expired)
+        vm.roll(block.number + 101);
+
+        vm.expectEmit(true, true, false, true);
+        emit IntendedSetAPY(newAPY, block.number, owner);
+
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Should not commit (expired, treated as new preview)
+        assertEq(phlimbo.desiredAPYBps(), 0, "Should not commit after 101 blocks");
+    }
+
+    function test_getPendingAPYInfo_returns_correct_values() public {
+        uint256 newAPY = 800;
+
+        // Initial state
+        (uint256 pendingAPY, uint256 pendingBlock, bool inProgress) = phlimbo.getPendingAPYInfo();
+        assertEq(pendingAPY, 0, "Should start with 0 pending APY");
+        assertEq(pendingBlock, 0, "Should start with 0 pending block");
+        assertFalse(inProgress, "Should start with no operation in progress");
+
+        // After preview
+        phlimbo.setDesiredAPY(newAPY);
+        (pendingAPY, pendingBlock, inProgress) = phlimbo.getPendingAPYInfo();
+        assertEq(pendingAPY, newAPY, "Should show pending APY");
+        assertEq(pendingBlock, block.number, "Should show pending block number");
+        assertTrue(inProgress, "Should show operation in progress");
+
+        // After commit
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(newAPY);
+        (,, inProgress) = phlimbo.getPendingAPYInfo();
+        assertFalse(inProgress, "Should show no operation in progress after commit");
+    }
+
+    function test_setDesiredAPY_updates_emission_rate_on_commit() public {
+        uint256 newAPY = 800; // 8%
+
+        // Stake some tokens
+        vm.prank(alice);
+        phlimbo.stake(200 ether);
+
+        // Preview APY change
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Emission rate should not change on preview
+        uint256 emissionAfterPreview = phlimbo.phUSDPerSecond();
+        assertEq(emissionAfterPreview, 0, "Emission rate should not change on preview");
+
+        // Commit APY change
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(newAPY);
+
+        // Emission rate should now be updated
+        uint256 emissionAfterCommit = phlimbo.phUSDPerSecond();
+        uint256 SECONDS_PER_YEAR = 365 days;
+        uint256 expectedRate = (200 ether * 800) / 10000 / SECONDS_PER_YEAR;
+        assertEq(emissionAfterCommit, expectedRate, "Emission rate should update on commit");
+    }
+
+    function test_setDesiredAPY_only_owner_can_call() public {
+        uint256 newAPY = 800;
+
+        vm.prank(alice);
+        vm.expectRevert();
+        phlimbo.setDesiredAPY(newAPY);
     }
 }
