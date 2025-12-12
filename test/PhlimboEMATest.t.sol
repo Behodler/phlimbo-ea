@@ -10,6 +10,11 @@ import "./Mocks.sol";
  * @notice Comprehensive test suite for Phlimbo with EMA-based reward collection
  */
 contract PhlimboEMATest is Test {
+    // Re-declare events for use in expectEmit
+    event RewardCollected(uint256 amount, uint256 instantRate, uint256 newSmoothedRate);
+    event YieldAccumulatorUpdated(address indexed oldAccumulator, address indexed newAccumulator);
+    event AlphaUpdated(uint256 oldAlpha, uint256 newAlpha);
+    event EmergencyWithdrawal(address indexed user, uint256 amount);
     PhlimboEA public phlimbo;
     MockFlax public phUSD;
     MockStable public rewardToken;
@@ -235,7 +240,7 @@ contract PhlimboEMATest is Test {
         vm.warp(block.timestamp + 10);
 
         vm.expectEmit(false, false, false, false);
-        emit PhlimboEA.RewardCollected(0, 0, 0); // We just check the event is emitted
+        emit RewardCollected(0, 0, 0); // We just check the event is emitted
 
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(100 ether);
@@ -422,7 +427,7 @@ contract PhlimboEMATest is Test {
         address newAccumulator = address(0x999);
 
         vm.expectEmit(true, true, false, false);
-        emit PhlimboEA.YieldAccumulatorUpdated(address(yieldAccumulator), newAccumulator);
+        emit YieldAccumulatorUpdated(address(yieldAccumulator), newAccumulator);
 
         phlimbo.setYieldAccumulator(newAccumulator);
 
@@ -444,7 +449,7 @@ contract PhlimboEMATest is Test {
         uint256 newAlpha = 0.2e18; // 20%
 
         vm.expectEmit(false, false, false, true);
-        emit PhlimboEA.AlphaUpdated(ALPHA, newAlpha);
+        emit AlphaUpdated(ALPHA, newAlpha);
 
         phlimbo.setAlpha(newAlpha);
 
@@ -789,7 +794,7 @@ contract PhlimboEMATest is Test {
 
         // Expect EmergencyWithdrawal event
         vm.expectEmit(true, false, false, true);
-        emit IPhlimbo.EmergencyWithdrawal(alice, STAKE_AMOUNT);
+        emit EmergencyWithdrawal(alice, STAKE_AMOUNT);
 
         vm.prank(alice);
         phlimbo.pauseWithdraw(STAKE_AMOUNT);

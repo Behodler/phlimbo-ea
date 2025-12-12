@@ -1,0 +1,4 @@
+forge-std/=lib/forge-std/src/
+@openzeppelin/=lib/openzeppelin-contracts/
+@reflax-yield-vault/=lib/immutable/reflax-yield-vault/
+@flax-token/=lib/immutable/flax-token-v2/
