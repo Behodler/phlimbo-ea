@@ -777,4 +777,94 @@ contract PhlimboEMATest is Test {
         (uint256 remaining,,) = phlimbo.userInfo(alice);
         assertEq(remaining, 0, "No dust should remain");
     }
+
+    // ========================== VIEW FUNCTION PROJECTION TESTS ==========================
+
+    function test_pendingStable_shows_accurate_realtime_rewards_without_pool_update() public {
+        // Stake tokens
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Collect reward to initialize rate
+        vm.warp(block.timestamp + 10);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(100 ether);
+
+        // Claim any pending rewards to reset debt
+        vm.prank(alice);
+        phlimbo.claim();
+
+        // Add more rewards to the pot for projection
+        vm.warp(block.timestamp + 10);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(1000 ether);
+
+        // Claim again to reset debt with new rate
+        vm.prank(alice);
+        phlimbo.claim();
+
+        // Get pending rewards immediately after claim (should be zero)
+        uint256 pendingBefore = phlimbo.pendingStable(alice);
+        assertEq(pendingBefore, 0, "No rewards pending immediately after claim");
+
+        // Wait some time WITHOUT triggering pool update
+        uint256 timeElapsed = 100;
+        vm.warp(block.timestamp + timeElapsed);
+
+        // Get pending rewards - should show projected amount without pool update
+        uint256 pendingAfter = phlimbo.pendingStable(alice);
+
+        // Calculate expected projection
+        uint256 smoothedRate = phlimbo.smoothedStablePerSecond();
+        uint256 potentialReward = (smoothedRate * timeElapsed) / 1e18;
+        uint256 potBalance = rewardToken.balanceOf(address(phlimbo));
+        uint256 expectedDistribute = potentialReward > potBalance ? potBalance : potentialReward;
+        uint256 expectedPending = (STAKE_AMOUNT * expectedDistribute * 1e18) / phlimbo.totalStaked() / 1e18;
+
+        // pendingStable should show accurate projection without pool update
+        assertGt(pendingAfter, 0, "Should show pending rewards without pool update");
+        assertApproxEqRel(pendingAfter, expectedPending, 0.001e18, "Projected rewards should match calculation");
+    }
+
+    function test_pendingStable_projection_matches_actual_rewards_after_claim() public {
+        // Stake tokens
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Collect reward to initialize rate
+        vm.warp(block.timestamp + 10);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(100 ether);
+
+        // Claim initial pending rewards to reset debt
+        vm.prank(alice);
+        phlimbo.claim();
+
+        // Add large reward to ensure pot has sufficient balance for next claim
+        vm.warp(block.timestamp + 10);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(5000 ether);
+
+        // Claim to reset debt with new rate
+        vm.prank(alice);
+        phlimbo.claim();
+
+        // Wait some time
+        vm.warp(block.timestamp + 100);
+
+        // Get projected pending amount from view function
+        uint256 projectedPending = phlimbo.pendingStable(alice);
+        assertGt(projectedPending, 0, "Should have projected pending rewards");
+
+        // Now claim and check actual rewards received
+        uint256 balanceBefore = rewardToken.balanceOf(alice);
+        vm.prank(alice);
+        phlimbo.claim();
+        uint256 balanceAfter = rewardToken.balanceOf(alice);
+
+        uint256 actualReceived = balanceAfter - balanceBefore;
+
+        // Projected amount should match actual received amount
+        assertApproxEqRel(actualReceived, projectedPending, 0.001e18, "Projected should match actual rewards");
+    }
 }

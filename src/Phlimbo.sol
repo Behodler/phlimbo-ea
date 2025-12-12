@@ -448,7 +448,24 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
      */
     function pendingStable(address user) external view returns (uint256) {
         UserInfo storage userDetails = userInfo[user];
-        return (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;
+        uint256 _accStablePerShare = accStablePerShare;
+
+        if (block.timestamp > lastRewardTime && totalStaked != 0) {
+            uint256 timeElapsed = block.timestamp - lastRewardTime;
+            uint256 potentialReward = (smoothedStablePerSecond * timeElapsed) / PRECISION;
+
+            // Get pot balance and cap distribution
+            uint256 potBalance = rewardToken.balanceOf(address(this));
+
+            // Cap by available balance
+            uint256 toDistribute = potentialReward > potBalance ? potBalance : potentialReward;
+
+            if (toDistribute > 0) {
+                _accStablePerShare += (toDistribute * PRECISION) / totalStaked;
+            }
+        }
+
+        return (userDetails.amount * _accStablePerShare) / PRECISION - userDetails.stableDebt;
     }
 
     /**
