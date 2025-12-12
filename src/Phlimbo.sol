@@ -190,6 +190,9 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
         if (rewardBalance > 0) {
             rewardToken.safeTransfer(recipient, rewardBalance);
         }
+
+        // Pause the contract to prevent further interactions
+        _pause();
     }
 
     // ========================== PAUSE MECHANISM ==========================
@@ -201,6 +204,29 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
     function pause() public {
         require(msg.sender == pauser, "Only pauser can pause");
         _pause();
+    }
+
+    /**
+     * @notice Allows users to withdraw their staked phUSD when contract is paused
+     * @dev Emergency exit mechanism - does NOT claim rewards or update pool
+     * @param amount Amount of phUSD to withdraw
+     */
+    function pauseWithdraw(uint256 amount) external whenPaused {
+        UserInfo storage user = userInfo[msg.sender];
+        require(user.amount >= amount, "Insufficient balance");
+        require(amount > 0, "Amount must be greater than 0");
+
+        // Update user balance
+        user.amount -= amount;
+
+        // Update total staked
+        totalStaked -= amount;
+
+        // Transfer phUSD to user
+        IERC20(address(phUSD)).safeTransfer(msg.sender, amount);
+
+        // Emit emergency withdrawal event
+        emit EmergencyWithdrawal(msg.sender, amount);
     }
 
     // ========================== REWARD COLLECTION ==========================

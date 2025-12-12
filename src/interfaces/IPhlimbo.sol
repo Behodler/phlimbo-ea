@@ -9,6 +9,15 @@ import "../IFlax.sol";
  * @notice Interface for the PhlimboEA staking yield farm contract
  */
 interface IPhlimbo {
+    // ========================== EVENTS ==========================
+
+    /**
+     * @notice Emitted when a user makes an emergency withdrawal while contract is paused
+     * @param user Address of the user withdrawing
+     * @param amount Amount of phUSD withdrawn
+     */
+    event EmergencyWithdrawal(address indexed user, uint256 amount);
+
     // ========================== ADMIN FUNCTIONS ==========================
 
     /**
@@ -53,6 +62,13 @@ interface IPhlimbo {
      * @dev Can only be called by the designated pauser address
      */
     function pause() external;
+
+    /**
+     * @notice Allows users to withdraw their staked phUSD when contract is paused
+     * @dev Emergency exit mechanism - does NOT claim rewards or update pool
+     * @param amount Amount of phUSD to withdraw
+     */
+    function pauseWithdraw(uint256 amount) external;
 
     // ========================== REWARD COLLECTION ==========================
 

@@ -488,6 +488,349 @@ contract PhlimboEMATest is Test {
         phlimbo.withdraw(STAKE_AMOUNT);
     }
 
+    // ========================== EMERGENCY TRANSFER AND PAUSE WITHDRAW TESTS ==========================
+
+    function test_emergencyTransfer_pauses_contract() public {
+        // Stake some tokens first
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Contract should not be paused initially
+        assertFalse(phlimbo.paused(), "Contract should not be paused initially");
+
+        // Owner calls emergencyTransfer
+        address treasury = address(0x999);
+        phlimbo.emergencyTransfer(treasury);
+
+        // Contract should be paused after emergencyTransfer
+        assertTrue(phlimbo.paused(), "Contract should be paused after emergencyTransfer");
+    }
+
+    function test_pauseWithdraw_only_works_when_paused() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Try pauseWithdraw when not paused - should revert
+        vm.prank(alice);
+        vm.expectRevert();
+        phlimbo.pauseWithdraw(STAKE_AMOUNT);
+
+        // Pause the contract
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        // Now pauseWithdraw should work
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(STAKE_AMOUNT);
+
+        (uint256 amount,,) = phlimbo.userInfo(alice);
+        assertEq(amount, 0, "User balance should be 0 after pauseWithdraw");
+    }
+
+    function test_pauseWithdraw_correctly_updates_balances() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        uint256 totalStakedBefore = phlimbo.totalStaked();
+        (uint256 userAmountBefore,,) = phlimbo.userInfo(alice);
+
+        // Pause the contract
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        // Withdraw half using pauseWithdraw
+        uint256 withdrawAmount = STAKE_AMOUNT / 2;
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(withdrawAmount);
+
+        // Check balances updated correctly
+        (uint256 userAmountAfter,,) = phlimbo.userInfo(alice);
+        uint256 totalStakedAfter = phlimbo.totalStaked();
+
+        assertEq(userAmountAfter, userAmountBefore - withdrawAmount, "User balance should decrease");
+        assertEq(totalStakedAfter, totalStakedBefore - withdrawAmount, "Total staked should decrease");
+    }
+
+    function test_pauseWithdraw_transfers_correct_amount() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Pause the contract
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        uint256 balanceBefore = phUSD.balanceOf(alice);
+        uint256 withdrawAmount = STAKE_AMOUNT / 2;
+
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(withdrawAmount);
+
+        uint256 balanceAfter = phUSD.balanceOf(alice);
+        assertEq(balanceAfter - balanceBefore, withdrawAmount, "Should transfer correct amount");
+    }
+
+    function test_pauseWithdraw_doesnt_claim_rewards() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Collect rewards to build up pot
+        vm.warp(block.timestamp + 10);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(100 ether);
+
+        // Wait for rewards to accrue
+        vm.warp(block.timestamp + 100);
+
+        // Check pending rewards before pause
+        uint256 pendingBefore = phlimbo.pendingStable(alice);
+        assertGt(pendingBefore, 0, "Should have pending rewards");
+
+        // Pause and use pauseWithdraw
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        uint256 stableBalanceBefore = rewardToken.balanceOf(alice);
+
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(STAKE_AMOUNT);
+
+        uint256 stableBalanceAfter = rewardToken.balanceOf(alice);
+
+        // Should NOT have received any reward tokens
+        assertEq(stableBalanceAfter, stableBalanceBefore, "Should not receive rewards during pauseWithdraw");
+    }
+
+    function test_pauseWithdraw_doesnt_update_pool() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Collect rewards
+        vm.warp(block.timestamp + 10);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(100 ether);
+
+        // Wait for time to pass
+        vm.warp(block.timestamp + 100);
+
+        // Pause the contract
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        // Get pool state before pauseWithdraw
+        uint256 accStableBefore = phlimbo.accStablePerShare();
+        uint256 lastRewardTimeBefore = phlimbo.lastRewardTime();
+
+        // Execute pauseWithdraw
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(STAKE_AMOUNT / 2);
+
+        // Get pool state after pauseWithdraw
+        uint256 accStableAfter = phlimbo.accStablePerShare();
+        uint256 lastRewardTimeAfter = phlimbo.lastRewardTime();
+
+        // Pool state should not change
+        assertEq(accStableAfter, accStableBefore, "accStablePerShare should not change");
+        assertEq(lastRewardTimeAfter, lastRewardTimeBefore, "lastRewardTime should not change");
+    }
+
+    function test_users_cannot_stake_after_emergency_pause() public {
+        // Execute emergency transfer which should pause the contract
+        address treasury = address(0x999);
+        phlimbo.emergencyTransfer(treasury);
+
+        // Bob tries to stake - should fail
+        vm.prank(bob);
+        vm.expectRevert();
+        phlimbo.stake(STAKE_AMOUNT);
+    }
+
+    function test_users_cannot_withdraw_after_emergency_pause() public {
+        // Alice stakes first
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Execute emergency transfer which should pause the contract
+        address treasury = address(0x999);
+        phlimbo.emergencyTransfer(treasury);
+
+        // Alice tries to withdraw - should fail
+        vm.prank(alice);
+        vm.expectRevert();
+        phlimbo.withdraw(STAKE_AMOUNT);
+    }
+
+    function test_users_cannot_claim_after_emergency_pause() public {
+        // Alice stakes first
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Collect rewards
+        vm.warp(block.timestamp + 10);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(100 ether);
+
+        // Wait for rewards to accrue
+        vm.warp(block.timestamp + 100);
+
+        // Execute emergency transfer which should pause the contract
+        address treasury = address(0x999);
+        phlimbo.emergencyTransfer(treasury);
+
+        // Alice tries to claim - should fail
+        vm.prank(alice);
+        vm.expectRevert();
+        phlimbo.claim();
+    }
+
+    function test_pauseWithdraw_rejects_withdrawal_exceeding_balance() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Pause the contract
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        // Try to withdraw more than balance
+        vm.prank(alice);
+        vm.expectRevert("Insufficient balance");
+        phlimbo.pauseWithdraw(STAKE_AMOUNT + 1 ether);
+    }
+
+    function test_pauseWithdraw_rejects_zero_amount() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Pause the contract
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        // Try to withdraw zero
+        vm.prank(alice);
+        vm.expectRevert("Amount must be greater than 0");
+        phlimbo.pauseWithdraw(0);
+    }
+
+    function test_full_emergency_scenario() public {
+        // Setup: Alice and Bob stake
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT / 2);
+
+        // Add rewards to the system
+        vm.warp(block.timestamp + 10);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(100 ether);
+
+        // Wait for rewards to accrue
+        vm.warp(block.timestamp + 100);
+
+        // Check state before emergency
+        uint256 contractPhUSDBefore = phUSD.balanceOf(address(phlimbo));
+        uint256 contractRewardBefore = rewardToken.balanceOf(address(phlimbo));
+        assertGt(contractPhUSDBefore, 0, "Contract should have phUSD");
+        assertGt(contractRewardBefore, 0, "Contract should have rewards");
+
+        // Emergency: Owner calls emergencyTransfer
+        address treasury = address(0x999);
+        phlimbo.emergencyTransfer(treasury);
+
+        // Verify tokens transferred and contract paused
+        assertTrue(phlimbo.paused(), "Contract should be paused");
+        assertEq(phUSD.balanceOf(treasury), contractPhUSDBefore, "Treasury should receive phUSD");
+        assertEq(rewardToken.balanceOf(treasury), contractRewardBefore, "Treasury should receive rewards");
+        assertEq(phUSD.balanceOf(address(phlimbo)), 0, "Contract phUSD balance should be 0");
+        assertEq(rewardToken.balanceOf(address(phlimbo)), 0, "Contract reward balance should be 0");
+
+        // Users can't use normal operations
+        vm.prank(alice);
+        vm.expectRevert();
+        phlimbo.withdraw(STAKE_AMOUNT);
+
+        vm.prank(bob);
+        vm.expectRevert();
+        phlimbo.claim();
+
+        // But users CAN use pauseWithdraw (even though no tokens in contract)
+        // This demonstrates the mechanism works, though users get nothing since tokens are gone
+        uint256 aliceBalanceBefore = phUSD.balanceOf(alice);
+
+        vm.prank(alice);
+        // This will revert with SafeERC20 error because contract has no tokens
+        // But the function logic itself works (validates balance, updates state)
+        vm.expectRevert();
+        phlimbo.pauseWithdraw(STAKE_AMOUNT);
+
+        // In a real scenario with partial emergency (some tokens remain):
+        // Transfer some tokens back to simulate partial recovery
+        vm.prank(treasury);
+        phUSD.transfer(address(phlimbo), STAKE_AMOUNT);
+
+        // Now alice can emergency withdraw her portion
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(STAKE_AMOUNT);
+
+        uint256 aliceBalanceAfter = phUSD.balanceOf(alice);
+        assertEq(aliceBalanceAfter - aliceBalanceBefore, STAKE_AMOUNT, "Alice should recover her stake");
+
+        // Verify state updated
+        (uint256 aliceAmount,,) = phlimbo.userInfo(alice);
+        assertEq(aliceAmount, 0, "Alice balance should be 0");
+    }
+
+    function test_pauseWithdraw_emits_event() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        // Pause the contract
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        // Expect EmergencyWithdrawal event
+        vm.expectEmit(true, false, false, true);
+        emit IPhlimbo.EmergencyWithdrawal(alice, STAKE_AMOUNT);
+
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(STAKE_AMOUNT);
+    }
+
+    function test_pauseWithdraw_multiple_users() public {
+        // Both alice and bob stake
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT);
+
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT / 2);
+
+        uint256 totalStakedBefore = phlimbo.totalStaked();
+        assertEq(totalStakedBefore, STAKE_AMOUNT + STAKE_AMOUNT / 2, "Total staked should be sum");
+
+        // Pause the contract
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        // Alice withdraws her full amount
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(STAKE_AMOUNT);
+
+        // Check alice's withdrawal
+        (uint256 aliceAmount,,) = phlimbo.userInfo(alice);
+        assertEq(aliceAmount, 0, "Alice balance should be 0");
+
+        // Bob withdraws half his amount
+        vm.prank(bob);
+        phlimbo.pauseWithdraw(STAKE_AMOUNT / 4);
+
+        // Check bob's partial withdrawal
+        (uint256 bobAmount,,) = phlimbo.userInfo(bob);
+        assertEq(bobAmount, STAKE_AMOUNT / 4, "Bob should have half remaining");
+
+        // Check total staked
+        uint256 totalStakedAfter = phlimbo.totalStaked();
+        assertEq(totalStakedAfter, STAKE_AMOUNT / 4, "Total staked should be bob's remainder");
+    }
+
     // ========================== EDGE CASE TESTS ==========================
 
     function test_handles_very_large_time_gap() public {
