@@ -18,6 +18,28 @@ interface IPhlimbo {
      */
     event EmergencyWithdrawal(address indexed user, uint256 amount);
 
+    /**
+     * @notice Emitted when a user stakes phUSD
+     * @param user Address of the user staking
+     * @param amount Amount of phUSD staked
+     */
+    event Staked(address indexed user, uint256 amount);
+
+    /**
+     * @notice Emitted when a user withdraws staked phUSD
+     * @param user Address of the user withdrawing
+     * @param amount Amount of phUSD withdrawn
+     */
+    event Withdrawn(address indexed user, uint256 amount);
+
+    /**
+     * @notice Emitted when a user claims rewards
+     * @param user Address of the user claiming rewards
+     * @param phUSDAmount Amount of phUSD rewards claimed
+     * @param stableAmount Amount of stable token rewards claimed
+     */
+    event RewardsClaimed(address indexed user, uint256 phUSDAmount, uint256 stableAmount);
+
     // ========================== ADMIN FUNCTIONS ==========================
 
     /**

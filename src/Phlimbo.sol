@@ -98,6 +98,7 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
     mapping(address => UserInfo) public userInfo;
 
     // ========================== EVENTS ==========================
+    // Note: Events are declared in IPhlimbo interface
 
     /// @notice Emitted when rewards are collected from yield-accumulator
     event RewardCollected(uint256 amount, uint256 instantRate, uint256 newSmoothedRate);
@@ -337,6 +338,9 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
 
         // Update phUSD emission rate based on new total staked
         _updatePhUSDEmissionRate();
+
+        // Emit event
+        emit Staked(msg.sender, amount);
     }
 
     /**
@@ -375,6 +379,9 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
 
         // Update phUSD emission rate based on new total staked
         _updatePhUSDEmissionRate();
+
+        // Emit event
+        emit Withdrawn(msg.sender, actualWithdrawAmount);
     }
 
     /**
@@ -461,6 +468,11 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
         uint256 pendingRewardAmount = (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;
         if (pendingRewardAmount > 0) {
             rewardToken.safeTransfer(user, pendingRewardAmount);
+        }
+
+        // Emit event with actual claimed amounts
+        if (pendingPhUSDAmount > 0 || pendingRewardAmount > 0) {
+            emit RewardsClaimed(user, pendingPhUSDAmount, pendingRewardAmount);
         }
     }
 
