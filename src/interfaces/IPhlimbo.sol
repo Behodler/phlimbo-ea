@@ -106,8 +106,9 @@ interface IPhlimbo {
     /**
      * @notice Stake phUSD tokens
      * @param amount Amount of phUSD to stake
+     * @param recipient Address to receive the staked position (use address(0) for msg.sender)
      */
-    function stake(uint256 amount) external;
+    function stake(uint256 amount, address recipient) external;
 
     /**
      * @notice Withdraw staked phUSD and claim rewards

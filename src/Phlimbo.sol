@@ -312,20 +312,26 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
     /**
      * @notice Stake phUSD tokens
      * @param amount Amount of phUSD to stake
+     * @param recipient Address to receive the staked position (use address(0) for msg.sender)
      */
-    function stake(uint256 amount) external whenNotPaused {
+    function stake(uint256 amount, address recipient) external whenNotPaused {
         require(amount >= MINIMUM_STAKE, "Below minimum stake");
+
+        // Default to msg.sender if recipient is zero address
+        if (recipient == address(0)) {
+            recipient = msg.sender;
+        }
 
         _updatePool();
 
-        UserInfo storage user = userInfo[msg.sender];
+        UserInfo storage user = userInfo[recipient];
 
         // Claim any pending rewards first
         if (user.amount > 0) {
-            _claimRewards(msg.sender);
+            _claimRewards(recipient);
         }
 
-        // Transfer phUSD from user
+        // Transfer phUSD from msg.sender (caller always pays)
         IERC20(address(phUSD)).safeTransferFrom(msg.sender, address(this), amount);
 
         // Update user info
@@ -340,7 +346,7 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
         _updatePhUSDEmissionRate();
 
         // Emit event
-        emit Staked(msg.sender, amount);
+        emit Staked(recipient, amount);
     }
 
     /**

@@ -103,7 +103,7 @@ contract PhlimboEMATest is Test {
 
     function test_stake_updates_user_balance() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         (uint256 amount,,) = phlimbo.userInfo(alice);
         assertEq(amount, STAKE_AMOUNT, "User balance should equal staked amount");
@@ -111,7 +111,7 @@ contract PhlimboEMATest is Test {
 
     function test_stake_updates_total_staked() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         uint256 totalStaked = phlimbo.totalStaked();
         assertEq(totalStaked, STAKE_AMOUNT, "Total staked should increase by stake amount");
@@ -121,7 +121,7 @@ contract PhlimboEMATest is Test {
         uint256 balanceBefore = phUSD.balanceOf(alice);
 
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         uint256 balanceAfter = phUSD.balanceOf(alice);
         assertEq(balanceBefore - balanceAfter, STAKE_AMOUNT, "Tokens should be transferred from user");
@@ -130,11 +130,40 @@ contract PhlimboEMATest is Test {
         assertEq(contractBalance, STAKE_AMOUNT, "Tokens should be in contract");
     }
 
+    function test_stake_on_behalf_of_another_address() public {
+        // Alice stakes on behalf of Bob
+        uint256 aliceBalanceBefore = phUSD.balanceOf(alice);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, bob);
+
+        // Alice's balance should decrease (she pays)
+        uint256 aliceBalanceAfter = phUSD.balanceOf(alice);
+        assertEq(aliceBalanceBefore - aliceBalanceAfter, STAKE_AMOUNT, "Alice should pay for the stake");
+
+        // Bob's userInfo should be updated (he receives the position)
+        (uint256 bobAmount,,) = phlimbo.userInfo(bob);
+        assertEq(bobAmount, STAKE_AMOUNT, "Bob should receive the staked position");
+
+        // Alice's userInfo should NOT be updated
+        (uint256 aliceAmount,,) = phlimbo.userInfo(alice);
+        assertEq(aliceAmount, 0, "Alice should not receive the staked position");
+    }
+
+    function test_stake_with_address_zero_defaults_to_msg_sender() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
+
+        // Alice's userInfo should be updated (backward compatibility)
+        (uint256 amount,,) = phlimbo.userInfo(alice);
+        assertEq(amount, STAKE_AMOUNT, "address(0) should default to msg.sender");
+    }
+
     // ========================== WITHDRAWAL TESTS ==========================
 
     function test_withdraw_returns_tokens() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         uint256 balanceBefore = phUSD.balanceOf(alice);
 
@@ -255,7 +284,7 @@ contract PhlimboEMATest is Test {
 
     function test_EMA_smooths_choppy_rewards() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         uint256[] memory rates = new uint256[](5);
 
@@ -313,7 +342,7 @@ contract PhlimboEMATest is Test {
 
     function test_updatePool_accrues_rewards_based_on_smoothed_rate() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Collect reward to initialize rate
         vm.warp(block.timestamp + 10);
@@ -327,7 +356,7 @@ contract PhlimboEMATest is Test {
 
         // Trigger pool update by having bob stake
         vm.prank(bob);
-        phlimbo.stake(1 ether);
+        phlimbo.stake(1 ether, address(0));
 
         uint256 accStableAfter = phlimbo.accStablePerShare();
 
@@ -336,7 +365,7 @@ contract PhlimboEMATest is Test {
 
     function test_updatePool_caps_distribution_by_pot_balance() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Small reward to start
         vm.prank(address(yieldAccumulator));
@@ -349,7 +378,7 @@ contract PhlimboEMATest is Test {
 
         // Trigger pool update
         vm.prank(bob);
-        phlimbo.stake(1 ether);
+        phlimbo.stake(1 ether, address(0));
 
         uint256 potAfter = rewardToken.balanceOf(address(phlimbo));
 
@@ -374,7 +403,7 @@ contract PhlimboEMATest is Test {
 
     function test_claim_distributes_stable_rewards() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Collect rewards to build up pot
         vm.prank(address(yieldAccumulator));
@@ -397,7 +426,7 @@ contract PhlimboEMATest is Test {
         // This test verifies that EMA smoothing works to provide stable reward rates
         // despite irregular reward collection patterns
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // First claim establishes baseline
         vm.warp(block.timestamp + 100);
@@ -483,12 +512,12 @@ contract PhlimboEMATest is Test {
 
         vm.prank(bob);
         vm.expectRevert();
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
     }
 
     function test_pause_prevents_withdraw() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         vm.prank(pauser);
         phlimbo.pause();
@@ -503,7 +532,7 @@ contract PhlimboEMATest is Test {
     function test_emergencyTransfer_pauses_contract() public {
         // Stake some tokens first
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Contract should not be paused initially
         assertFalse(phlimbo.paused(), "Contract should not be paused initially");
@@ -518,7 +547,7 @@ contract PhlimboEMATest is Test {
 
     function test_pauseWithdraw_only_works_when_paused() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Try pauseWithdraw when not paused - should revert
         vm.prank(alice);
@@ -539,7 +568,7 @@ contract PhlimboEMATest is Test {
 
     function test_pauseWithdraw_correctly_updates_balances() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         uint256 totalStakedBefore = phlimbo.totalStaked();
         (uint256 userAmountBefore,,) = phlimbo.userInfo(alice);
@@ -563,7 +592,7 @@ contract PhlimboEMATest is Test {
 
     function test_pauseWithdraw_transfers_correct_amount() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Pause the contract
         vm.prank(pauser);
@@ -581,7 +610,7 @@ contract PhlimboEMATest is Test {
 
     function test_pauseWithdraw_doesnt_claim_rewards() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Collect rewards to build up pot
         vm.warp(block.timestamp + 10);
@@ -612,7 +641,7 @@ contract PhlimboEMATest is Test {
 
     function test_pauseWithdraw_doesnt_update_pool() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Collect rewards
         vm.warp(block.timestamp + 10);
@@ -651,13 +680,13 @@ contract PhlimboEMATest is Test {
         // Bob tries to stake - should fail
         vm.prank(bob);
         vm.expectRevert();
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
     }
 
     function test_users_cannot_withdraw_after_emergency_pause() public {
         // Alice stakes first
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Execute emergency transfer which should pause the contract
         address treasury = address(0x999);
@@ -672,7 +701,7 @@ contract PhlimboEMATest is Test {
     function test_users_cannot_claim_after_emergency_pause() public {
         // Alice stakes first
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Collect rewards
         vm.warp(block.timestamp + 10);
@@ -694,7 +723,7 @@ contract PhlimboEMATest is Test {
 
     function test_pauseWithdraw_rejects_withdrawal_exceeding_balance() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Pause the contract
         vm.prank(pauser);
@@ -708,7 +737,7 @@ contract PhlimboEMATest is Test {
 
     function test_pauseWithdraw_rejects_zero_amount() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Pause the contract
         vm.prank(pauser);
@@ -723,10 +752,10 @@ contract PhlimboEMATest is Test {
     function test_full_emergency_scenario() public {
         // Setup: Alice and Bob stake
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         vm.prank(bob);
-        phlimbo.stake(STAKE_AMOUNT / 2);
+        phlimbo.stake(STAKE_AMOUNT / 2, address(0));
 
         // Add rewards to the system
         vm.warp(block.timestamp + 10);
@@ -791,7 +820,7 @@ contract PhlimboEMATest is Test {
 
     function test_pauseWithdraw_emits_event() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Pause the contract
         vm.prank(pauser);
@@ -808,10 +837,10 @@ contract PhlimboEMATest is Test {
     function test_pauseWithdraw_multiple_users() public {
         // Both alice and bob stake
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         vm.prank(bob);
-        phlimbo.stake(STAKE_AMOUNT / 2);
+        phlimbo.stake(STAKE_AMOUNT / 2, address(0));
 
         uint256 totalStakedBefore = phlimbo.totalStaked();
         assertEq(totalStakedBefore, STAKE_AMOUNT + STAKE_AMOUNT / 2, "Total staked should be sum");
@@ -845,7 +874,7 @@ contract PhlimboEMATest is Test {
 
     function test_handles_very_large_time_gap() public {
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(100 ether);
@@ -855,7 +884,7 @@ contract PhlimboEMATest is Test {
 
         // Should not revert and should cap by pot balance
         vm.prank(bob);
-        phlimbo.stake(1 ether);
+        phlimbo.stake(1 ether, address(0));
 
         assertGe(rewardToken.balanceOf(address(phlimbo)), 0, "Should handle large time gap");
     }
@@ -886,7 +915,7 @@ contract PhlimboEMATest is Test {
 
         // Stake 200 phUSD
         vm.prank(alice);
-        phlimbo.stake(200 ether);
+        phlimbo.stake(200 ether, address(0));
 
         // Expected: phUSDPerSecond = (200 * 800) / 10000 / 31536000
         // = 160000 / 10000 / 31536000 = 16 / 31536000 ≈ 5.07e-7
@@ -904,12 +933,12 @@ contract PhlimboEMATest is Test {
 
         // Initial stake
         vm.prank(alice);
-        phlimbo.stake(100 ether);
+        phlimbo.stake(100 ether, address(0));
         uint256 rateBefore = phlimbo.phUSDPerSecond();
 
         // Additional stake increases total staked
         vm.prank(bob);
-        phlimbo.stake(100 ether);
+        phlimbo.stake(100 ether, address(0));
         uint256 rateAfter = phlimbo.phUSDPerSecond();
 
         // Rate should double (200 staked vs 100 staked)
@@ -924,7 +953,7 @@ contract PhlimboEMATest is Test {
 
         // Initial stake
         vm.prank(alice);
-        phlimbo.stake(200 ether);
+        phlimbo.stake(200 ether, address(0));
         uint256 rateBefore = phlimbo.phUSDPerSecond();
 
         // Withdraw half
@@ -954,7 +983,7 @@ contract PhlimboEMATest is Test {
 
         // Stake
         vm.prank(alice);
-        phlimbo.stake(100 ether);
+        phlimbo.stake(100 ether, address(0));
         assertGt(phlimbo.phUSDPerSecond(), 0, "Rate should be positive after staking");
 
         // Full withdraw
@@ -966,7 +995,7 @@ contract PhlimboEMATest is Test {
     function test_setDesiredAPY_triggers_emission_rate_recalculation() public {
         // Stake some tokens
         vm.prank(alice);
-        phlimbo.stake(200 ether);
+        phlimbo.stake(200 ether, address(0));
 
         // Set APY to 8%
         phlimbo.setDesiredAPY(800);
@@ -993,7 +1022,7 @@ contract PhlimboEMATest is Test {
         phlimbo.setDesiredAPY(800);
 
         vm.prank(alice);
-        phlimbo.stake(200 ether);
+        phlimbo.stake(200 ether, address(0));
 
         uint256 rate = phlimbo.phUSDPerSecond();
 
@@ -1014,7 +1043,7 @@ contract PhlimboEMATest is Test {
         vm.roll(block.number + 1);
         phlimbo.setDesiredAPY(800);
         vm.prank(alice);
-        phlimbo.stake(200 ether);
+        phlimbo.stake(200 ether, address(0));
 
         // Wait 1 day
         vm.warp(block.timestamp + 1 days);
@@ -1036,14 +1065,14 @@ contract PhlimboEMATest is Test {
 
         vm.prank(alice);
         vm.expectRevert("Below minimum stake");
-        phlimbo.stake(belowMinimum);
+        phlimbo.stake(belowMinimum, address(0));
     }
 
     function test_stake_at_minimum_succeeds() public {
         uint256 minimum = phlimbo.MINIMUM_STAKE();
 
         vm.prank(alice);
-        phlimbo.stake(minimum);
+        phlimbo.stake(minimum, address(0));
 
         (uint256 amount,,) = phlimbo.userInfo(alice);
         assertEq(amount, minimum, "Should stake exactly at minimum");
@@ -1052,7 +1081,7 @@ contract PhlimboEMATest is Test {
     function test_withdraw_leaving_dust_withdraws_all() public {
         uint256 stakeAmount = 10 ether;
         vm.prank(alice);
-        phlimbo.stake(stakeAmount);
+        phlimbo.stake(stakeAmount, address(0));
 
         // Try to withdraw leaving dust (500 wei < MINIMUM_STAKE)
         uint256 attemptedWithdraw = stakeAmount - 500;
@@ -1073,7 +1102,7 @@ contract PhlimboEMATest is Test {
     function test_withdraw_above_minimum_remaining_works() public {
         uint256 stakeAmount = 100 ether;
         vm.prank(alice);
-        phlimbo.stake(stakeAmount);
+        phlimbo.stake(stakeAmount, address(0));
 
         // Withdraw amount that leaves >= MINIMUM_STAKE
         uint256 withdrawAmount = 50 ether;
@@ -1104,7 +1133,7 @@ contract PhlimboEMATest is Test {
         // Attacker stakes minimum (can't stake less due to minimum check)
         uint256 attackerStake = phlimbo.MINIMUM_STAKE();
         vm.prank(alice); // alice is the attacker
-        phlimbo.stake(attackerStake);
+        phlimbo.stake(attackerStake, address(0));
 
         // Large reward comes in while attacker is sole staker
         uint256 largeReward = 1000 ether;
@@ -1117,7 +1146,7 @@ contract PhlimboEMATest is Test {
         // Legitimate user stakes a much larger amount
         uint256 legitimateStake = 1000 ether;
         vm.prank(bob);
-        phlimbo.stake(legitimateStake);
+        phlimbo.stake(legitimateStake, address(0));
 
         // Additional reward comes in after legitimate user joins
         vm.warp(block.timestamp + 100);
@@ -1156,7 +1185,7 @@ contract PhlimboEMATest is Test {
 
         uint256 stakeAmount = phlimbo.MINIMUM_STAKE() + 100;
         vm.prank(alice);
-        phlimbo.stake(stakeAmount);
+        phlimbo.stake(stakeAmount, address(0));
 
         // Try to withdraw most of it, leaving less than minimum
         uint256 attemptWithdraw = 101; // Would leave MINIMUM_STAKE - 1
@@ -1178,7 +1207,7 @@ contract PhlimboEMATest is Test {
     function test_pendingStable_shows_accurate_realtime_rewards_without_pool_update() public {
         // Stake tokens
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Collect reward to initialize rate
         vm.warp(block.timestamp + 10);
@@ -1224,7 +1253,7 @@ contract PhlimboEMATest is Test {
     function test_pendingStable_projection_matches_actual_rewards_after_claim() public {
         // Stake tokens
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Collect reward to initialize rate
         vm.warp(block.timestamp + 10);
@@ -1508,7 +1537,7 @@ contract PhlimboEMATest is Test {
 
         // Stake some tokens
         vm.prank(alice);
-        phlimbo.stake(200 ether);
+        phlimbo.stake(200 ether, address(0));
 
         // Preview APY change
         phlimbo.setDesiredAPY(newAPY);
@@ -1544,13 +1573,13 @@ contract PhlimboEMATest is Test {
         emit Staked(alice, STAKE_AMOUNT);
 
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
     }
 
     function test_withdraw_emits_event() public {
         // First stake
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Expect Withdrawn event with correct parameters
         vm.expectEmit(true, false, false, true);
@@ -1564,7 +1593,7 @@ contract PhlimboEMATest is Test {
         // Stake an amount
         uint256 stakeAmount = 10 ether;
         vm.prank(alice);
-        phlimbo.stake(stakeAmount);
+        phlimbo.stake(stakeAmount, address(0));
 
         // Try to withdraw leaving dust (should withdraw full amount)
         uint256 attemptedWithdraw = stakeAmount - 500;
@@ -1586,7 +1615,7 @@ contract PhlimboEMATest is Test {
 
         // This test verifies the event emission mechanism works
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Set up rewards with small amounts and short time to avoid pot depletion
         phlimbo.setDesiredAPY(800);
@@ -1610,7 +1639,7 @@ contract PhlimboEMATest is Test {
     function test_claim_emits_event_when_only_phUSD_rewards() public {
         // Stake tokens
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Set APY to generate phUSD rewards
         phlimbo.setDesiredAPY(800); // 8%
@@ -1635,7 +1664,7 @@ contract PhlimboEMATest is Test {
         // Note: This test verifies claim works with only stable rewards
         // RewardsClaimed event is emitted correctly (see note in test_claim_emits_RewardsClaimed_event)
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         rewardToken.mint(address(yieldAccumulator), 10000 ether);
         vm.warp(block.timestamp + 10);
@@ -1655,7 +1684,7 @@ contract PhlimboEMATest is Test {
         // Note: Withdraw calls _claimRewards which emits RewardsClaimed
         // This test verifies the Withdrawn event and that rewards are claimed
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         phlimbo.setDesiredAPY(800);
         vm.roll(block.number + 1);
@@ -1679,7 +1708,7 @@ contract PhlimboEMATest is Test {
         // Note: Staking with existing position calls _claimRewards which emits RewardsClaimed
         // This test verifies the Staked event and that rewards are claimed
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         phlimbo.setDesiredAPY(800);
         vm.roll(block.number + 1);
@@ -1694,7 +1723,7 @@ contract PhlimboEMATest is Test {
 
         // Don't use expectEmit due to Transfer events - just verify stake works
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Test passes if stake executes without reverting
     }
@@ -1702,7 +1731,7 @@ contract PhlimboEMATest is Test {
     function test_no_RewardsClaimed_event_when_no_rewards() public {
         // Stake tokens
         vm.prank(alice);
-        phlimbo.stake(STAKE_AMOUNT);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Immediately claim without any rewards accruing
         // RewardsClaimed should NOT be emitted (both amounts are 0)
