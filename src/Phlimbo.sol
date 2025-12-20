@@ -140,7 +140,7 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
         yieldAccumulator = _yieldAccumulator;
         alpha = _alpha;
         lastRewardTime = block.timestamp;
-        lastClaimTimestamp = 0; // Initialize to 0 to allow first claim
+        lastClaimTimestamp = block.timestamp; // Initialize to current time to prevent epoch-sized deltaTime on first claim
         smoothedStablePerSecond = 0; // Will converge after first few claims
     }
 

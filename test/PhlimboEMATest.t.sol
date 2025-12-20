@@ -181,6 +181,8 @@ contract PhlimboEMATest is Test {
         uint256 accumBefore = rewardToken.balanceOf(address(yieldAccumulator));
         uint256 phlimboBefore = rewardToken.balanceOf(address(phlimbo));
 
+        vm.warp(block.timestamp + 1); // Advance time to allow first claim
+
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(rewardAmount);
 
@@ -206,18 +208,21 @@ contract PhlimboEMATest is Test {
     function test_collectReward_initializes_smoothed_rate_on_first_call() public {
         uint256 rewardAmount = 100 ether;
 
-        vm.warp(block.timestamp + 10); // 10 seconds elapsed
+        // Get the timestamp when contract was deployed
+        uint256 deployTimestamp = block.timestamp;
+
+        vm.warp(block.timestamp + 10); // 10 seconds elapsed since deployment
 
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(rewardAmount);
 
         // First claim should initialize smoothedStablePerSecond to instantRate
-        // With lastClaimTimestamp = 0, deltaTime = current block.timestamp
-        // Foundry starts at timestamp 1, so after warp +10, timestamp = 11
-        // instantRate = (100 ether * 1e18) / 11
-        uint256 actualTimestamp = block.timestamp;
-        uint256 expectedRate = (rewardAmount * 1e18) / actualTimestamp;
-        assertEq(phlimbo.smoothedStablePerSecond(), expectedRate, "Should initialize to instant rate");
+        // With lastClaimTimestamp = block.timestamp (at deployment), deltaTime = elapsed time
+        // deltaTime = 10 seconds (current timestamp - deploy timestamp)
+        // instantRate = (100 ether * 1e18) / 10
+        uint256 deltaTime = block.timestamp - deployTimestamp;
+        uint256 expectedRate = (rewardAmount * 1e18) / deltaTime;
+        assertEq(phlimbo.smoothedStablePerSecond(), expectedRate, "Should initialize to instant rate based on actual elapsed time");
     }
 
     function test_collectReward_updates_smoothed_rate_with_EMA() public {
@@ -244,6 +249,9 @@ contract PhlimboEMATest is Test {
     }
 
     function test_collectReward_reverts_on_same_block_claim() public {
+        // Advance time to allow first claim
+        vm.warp(block.timestamp + 1);
+
         // First claim in the block
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(100 ether);
@@ -255,6 +263,9 @@ contract PhlimboEMATest is Test {
     }
 
     function test_collectReward_succeeds_in_different_blocks() public {
+        // Advance time to allow first claim
+        vm.warp(block.timestamp + 1);
+
         // First claim
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(100 ether);
@@ -367,6 +378,9 @@ contract PhlimboEMATest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
+        // Advance time to allow first claim
+        vm.warp(block.timestamp + 1);
+
         // Small reward to start
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(1 ether);
@@ -391,6 +405,9 @@ contract PhlimboEMATest is Test {
         // No stakers yet
         assertEq(phlimbo.totalStaked(), 0, "No stakers initially");
 
+        // Advance time to allow first claim
+        vm.warp(block.timestamp + 1);
+
         // Collect reward
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(100 ether);
@@ -405,12 +422,17 @@ contract PhlimboEMATest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
+        // Advance time significantly before first claim to reduce instant rate
+        vm.warp(block.timestamp + 100);
+
+        // Mint additional rewards to yield accumulator for this test
+        rewardToken.mint(address(yieldAccumulator), 100 ether);
+
         // Collect rewards to build up pot
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(100 ether);
 
-        // Wait for rewards to accrue
-        vm.warp(block.timestamp + 100);
+        // Claim immediately (no additional wait) to test reward distribution without pot depletion
 
         uint256 stableBefore = rewardToken.balanceOf(alice);
 
@@ -876,6 +898,9 @@ contract PhlimboEMATest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
+        // Advance time to allow first claim
+        vm.warp(block.timestamp + 1);
+
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(100 ether);
 
@@ -890,6 +915,9 @@ contract PhlimboEMATest is Test {
     }
 
     function test_multiple_sequential_claims_different_blocks() public {
+        // Advance time to allow first claim
+        vm.warp(block.timestamp + 1);
+
         // Multiple claims in different blocks should all work
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(10 ether);
@@ -1134,6 +1162,9 @@ contract PhlimboEMATest is Test {
         uint256 attackerStake = phlimbo.MINIMUM_STAKE();
         vm.prank(alice); // alice is the attacker
         phlimbo.stake(attackerStake, address(0));
+
+        // Advance time to allow first claim
+        vm.warp(block.timestamp + 1);
 
         // Large reward comes in while attacker is sole staker
         uint256 largeReward = 1000 ether;
@@ -1623,11 +1654,11 @@ contract PhlimboEMATest is Test {
         phlimbo.setDesiredAPY(800);
 
         rewardToken.mint(address(yieldAccumulator), 10000 ether);
-        vm.warp(block.timestamp + 10);
+        vm.warp(block.timestamp + 100); // Longer time for first claim to reduce instant rate
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(10000 ether);
 
-        vm.warp(block.timestamp + 1); // Just 1 second to minimize distribution
+        // No additional wait - claim immediately to avoid pot depletion
 
         // Verify claim works (RewardsClaimed event is emitted internally)
         vm.prank(alice);
@@ -1667,11 +1698,11 @@ contract PhlimboEMATest is Test {
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
         rewardToken.mint(address(yieldAccumulator), 10000 ether);
-        vm.warp(block.timestamp + 10);
+        vm.warp(block.timestamp + 100); // Longer time for first claim to reduce instant rate
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(10000 ether);
 
-        vm.warp(block.timestamp + 1); // Just 1 second to minimize distribution
+        // No additional wait - claim immediately to avoid pot depletion
 
         // Claim without setting APY (only stable rewards)
         vm.prank(alice);
@@ -1691,11 +1722,11 @@ contract PhlimboEMATest is Test {
         phlimbo.setDesiredAPY(800);
 
         rewardToken.mint(address(yieldAccumulator), 10000 ether);
-        vm.warp(block.timestamp + 10);
+        vm.warp(block.timestamp + 100); // Longer time for first claim to reduce instant rate
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(10000 ether);
 
-        vm.warp(block.timestamp + 1); // Just 1 second to minimize distribution
+        // No additional wait - withdraw immediately to avoid pot depletion
 
         // Don't use expectEmit due to Transfer events - just verify withdraw works
         vm.prank(alice);
@@ -1715,11 +1746,11 @@ contract PhlimboEMATest is Test {
         phlimbo.setDesiredAPY(800);
 
         rewardToken.mint(address(yieldAccumulator), 10000 ether);
-        vm.warp(block.timestamp + 10);
+        vm.warp(block.timestamp + 100); // Longer time for first claim to reduce instant rate
         vm.prank(address(yieldAccumulator));
         phlimbo.collectReward(10000 ether);
 
-        vm.warp(block.timestamp + 1); // Just 1 second to minimize distribution
+        // No additional wait - stake immediately to avoid pot depletion
 
         // Don't use expectEmit due to Transfer events - just verify stake works
         vm.prank(alice);
