@@ -61,11 +61,6 @@ interface IPhlimbo {
     function setAlpha(uint256 _alpha) external;
 
     /**
-     * @notice Unpauses the contract (only owner)
-     */
-    function unpause() external;
-
-    /**
      * @notice Sets the address authorized to pause the contract
      * @param _pauser Address to authorize for pausing (can be zero address to disable pausing)
      */
@@ -76,14 +71,6 @@ interface IPhlimbo {
      * @param recipient Address to receive the tokens
      */
     function emergencyTransfer(address recipient) external;
-
-    // ========================== PAUSE MECHANISM ==========================
-
-    /**
-     * @notice Pauses the contract
-     * @dev Can only be called by the designated pauser address
-     */
-    function pause() external;
 
     /**
      * @notice Allows users to withdraw their staked phUSD when contract is paused
@@ -158,7 +145,6 @@ interface IPhlimbo {
     function phUSD() external view returns (IFlax);
     function rewardToken() external view returns (IERC20);
     function yieldAccumulator() external view returns (address);
-    function pauser() external view returns (address);
     function desiredAPYBps() external view returns (uint256);
     function phUSDPerSecond() external view returns (uint256);
     function lastClaimTimestamp() external view returns (uint256);

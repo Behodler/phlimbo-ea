@@ -7,13 +7,14 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./IFlax.sol";
 import "./interfaces/IPhlimbo.sol";
+import {IPausable} from "lib/mutable/pauser/src/interfaces/IPausable.sol";
 
 /**
  * @title PhlimboEA
  * @notice Staking yield farm for phUSD tokens with EMA-smoothed reward distribution
  * @dev Receives rewards from yield-accumulator contract and distributes them smoothly using EMA algorithm
  */
-contract PhlimboEA is Ownable, Pausable, IPhlimbo {
+contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
     using SafeERC20 for IERC20;
 
     // ========================== STATE VARIABLES ==========================
@@ -28,7 +29,7 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
     address public yieldAccumulator;
 
     /// @notice Address authorized to pause the contract
-    address public pauser;
+    address public override pauser;
 
     /// @notice Desired APY in basis points (e.g., 500 = 5%)
     uint256 public desiredAPYBps;
@@ -199,9 +200,11 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
     }
 
     /**
-     * @notice Unpauses the contract (only owner)
+     * @notice Unpauses the contract
+     * @dev Can only be called by the designated pauser address
      */
-    function unpause() public onlyOwner {
+    function unpause() public override {
+        require(msg.sender == pauser, "Only pauser can unpause");
         _unpause();
     }
 
@@ -238,7 +241,7 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo {
      * @notice Pauses the contract
      * @dev Can only be called by the designated pauser address
      */
-    function pause() public {
+    function pause() public override {
         require(msg.sender == pauser, "Only pauser can pause");
         _pause();
     }
