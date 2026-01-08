@@ -24,21 +24,20 @@ if [ ! -d "$REPO_NAME/src/interfaces" ]; then
     exit 1
 fi
 
-# Perform post-clone cleanup - keep only interfaces
-echo "Cleaning up implementation details, keeping only interfaces..."
+# Perform post-clone cleanup - keep only src/interfaces
+echo "Cleaning up, keeping only src/interfaces..."
 cd "$REPO_NAME" || exit 1
 
 # Save interfaces directory temporarily
-if [ -d "src/interfaces" ]; then
-    cp -r src/interfaces /tmp/interfaces_temp_$$
-fi
+cp -r src/interfaces /tmp/interfaces_temp_$$
 
-# Remove all src content except .git
-find src -mindepth 1 -maxdepth 1 ! -name '.git*' -exec rm -rf {} +
+# Remove everything except the src directory structure
+find . -mindepth 1 -maxdepth 1 ! -name 'src' -exec rm -rf {} +
+
+# Remove all src content
+rm -rf src/*
 
 # Restore interfaces
-if [ -d "/tmp/interfaces_temp_$$" ]; then
-    mv /tmp/interfaces_temp_$$ src/interfaces
-fi
+mv /tmp/interfaces_temp_$$ src/interfaces
 
 echo "Successfully added mutable dependency: $REPO_NAME (interfaces only)"
