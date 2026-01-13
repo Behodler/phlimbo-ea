@@ -1782,4 +1782,174 @@ contract PhlimboEMATest is Test {
         assertEq(phUSDAfter, phUSDBefore, "No phUSD rewards should be claimed");
         assertEq(stableAfter, stableBefore, "No stable rewards should be claimed");
     }
+
+    // ========================== ZERO APY TESTS ==========================
+
+    function test_zero_APY_stake_does_not_revert() public {
+        // APY starts at 0 by default, verify stake works
+        assertEq(phlimbo.desiredAPYBps(), 0, "APY should be 0 by default");
+
+        // Stake should succeed with zero APY
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
+
+        (uint256 amount,,) = phlimbo.userInfo(alice);
+        assertEq(amount, STAKE_AMOUNT, "Stake should succeed with zero APY");
+        assertEq(phlimbo.phUSDPerSecond(), 0, "Emission rate should be 0");
+    }
+
+    function test_zero_APY_claim_does_not_revert() public {
+        // Stake with zero APY
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
+
+        // Wait some time
+        vm.warp(block.timestamp + 100);
+
+        // Claim should not revert even with zero APY
+        vm.prank(alice);
+        phlimbo.claim();
+
+        // No phUSD rewards should have been claimed (APY is 0)
+        assertEq(phlimbo.pendingPhUSD(alice), 0, "No phUSD should be pending");
+    }
+
+    function test_zero_APY_withdraw_does_not_revert() public {
+        // Stake with zero APY
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
+
+        // Wait some time
+        vm.warp(block.timestamp + 100);
+
+        // Withdraw should not revert even with zero APY
+        uint256 balanceBefore = phUSD.balanceOf(alice);
+
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT);
+
+        uint256 balanceAfter = phUSD.balanceOf(alice);
+        assertEq(balanceAfter - balanceBefore, STAKE_AMOUNT, "Should withdraw full amount");
+    }
+
+    function test_zero_APY_with_stable_rewards_works() public {
+        // Stake with zero APY
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
+
+        // Mint extra tokens to accumulator
+        rewardToken.mint(address(yieldAccumulator), 10000 ether);
+
+        // Collect stable rewards
+        vm.warp(block.timestamp + 1000);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(100 ether);
+
+        // Rewards are accrued during collectReward (the _updatePool call inside it)
+        // Check pending stable rewards (should be positive based on accrual during collectReward)
+        uint256 pendingStable = phlimbo.pendingStable(alice);
+        assertGt(pendingStable, 0, "Should have pending stable rewards even with zero APY");
+
+        // Check pending phUSD (should be zero since APY is zero)
+        uint256 pendingPhUSD = phlimbo.pendingPhUSD(alice);
+        assertEq(pendingPhUSD, 0, "Should have no phUSD rewards with zero APY");
+
+        // Claim immediately after collectReward (no additional time passed = no additional accrual)
+        uint256 stableBefore = rewardToken.balanceOf(alice);
+        uint256 phUSDBefore = phUSD.balanceOf(alice);
+
+        vm.prank(alice);
+        phlimbo.claim();
+
+        uint256 stableAfter = rewardToken.balanceOf(alice);
+        uint256 phUSDAfter = phUSD.balanceOf(alice);
+
+        assertGt(stableAfter - stableBefore, 0, "Should receive stable rewards");
+        assertEq(phUSDAfter - phUSDBefore, 0, "Should not receive phUSD rewards");
+    }
+
+    function test_zero_APY_full_flow_stake_claim_withdraw() public {
+        // Comprehensive test of full user flow with zero APY
+
+        // 1. Stake
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
+
+        // 2. Add stable rewards to system
+        rewardToken.mint(address(yieldAccumulator), 10000 ether);
+        vm.warp(block.timestamp + 1000);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(100 ether);
+
+        // 3. Claim immediately after collectReward (rewards accrue during _updatePool in collectReward)
+        vm.prank(alice);
+        phlimbo.claim();
+
+        // 4. Stake more
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
+
+        // 5. Add more rewards
+        vm.warp(block.timestamp + 1000);
+        vm.prank(address(yieldAccumulator));
+        phlimbo.collectReward(100 ether);
+
+        // 6. Withdraw partial (should claim rewards and withdraw)
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT);
+
+        // 7. Withdraw remaining
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT);
+
+        // Verify user has fully withdrawn
+        (uint256 amount,,) = phlimbo.userInfo(alice);
+        assertEq(amount, 0, "User should have withdrawn everything");
+    }
+
+    function test_setting_APY_to_zero_does_not_revert() public {
+        // First set a non-zero APY
+        phlimbo.setDesiredAPY(800);
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(800);
+        assertEq(phlimbo.desiredAPYBps(), 800, "APY should be 800");
+
+        // Stake some tokens
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, address(0));
+        assertGt(phlimbo.phUSDPerSecond(), 0, "Emission rate should be positive");
+
+        // Wait and accrue some rewards
+        vm.warp(block.timestamp + 100);
+
+        // Now set APY to zero
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(0);
+        vm.roll(block.number + 1);
+        phlimbo.setDesiredAPY(0);
+
+        // Verify APY is zero
+        assertEq(phlimbo.desiredAPYBps(), 0, "APY should be 0 after setting");
+        assertEq(phlimbo.phUSDPerSecond(), 0, "Emission rate should be 0");
+
+        // Operations should still work
+        vm.warp(block.timestamp + 100);
+
+        // Claim should not revert
+        vm.prank(alice);
+        phlimbo.claim();
+
+        // Withdraw should not revert
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT / 2);
+
+        // Stake should not revert
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT / 4, address(0));
+
+        // No new phUSD rewards should accrue
+        vm.warp(block.timestamp + 100);
+        uint256 pendingPhUSD = phlimbo.pendingPhUSD(alice);
+        assertEq(pendingPhUSD, 0, "No phUSD should accrue with zero APY");
+    }
 }
