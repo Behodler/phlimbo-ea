@@ -55,10 +55,10 @@ interface IPhlimbo {
     function setYieldAccumulator(address _yieldAccumulator) external;
 
     /**
-     * @notice Sets the EMA alpha parameter
-     * @param _alpha New alpha value (scaled by 1e18)
+     * @notice Sets the depletion duration for reward distribution
+     * @param _duration New depletion duration in seconds
      */
-    function setAlpha(uint256 _alpha) external;
+    function setDepletionDuration(uint256 _duration) external;
 
     /**
      * @notice Sets the address authorized to pause the contract
@@ -82,7 +82,7 @@ interface IPhlimbo {
     // ========================== REWARD COLLECTION ==========================
 
     /**
-     * @notice Collects rewards from yield-accumulator and updates EMA-smoothed rate
+     * @notice Collects rewards from yield-accumulator and updates linear depletion rate
      * @dev Can only be called by the yield accumulator contract
      * @param amount Amount of reward tokens to collect
      */
@@ -147,9 +147,9 @@ interface IPhlimbo {
     function yieldAccumulator() external view returns (address);
     function desiredAPYBps() external view returns (uint256);
     function phUSDPerSecond() external view returns (uint256);
-    function lastClaimTimestamp() external view returns (uint256);
-    function smoothedStablePerSecond() external view returns (uint256);
-    function alpha() external view returns (uint256);
+    function rewardBalance() external view returns (uint256);
+    function depletionDuration() external view returns (uint256);
+    function rewardPerSecond() external view returns (uint256);
     function lastRewardTime() external view returns (uint256);
     function accPhUSDPerShare() external view returns (uint256);
     function accStablePerShare() external view returns (uint256);
