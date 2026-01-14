@@ -11,8 +11,8 @@ import {IPausable} from "lib/mutable/pauser/src/interfaces/IPausable.sol";
 
 /**
  * @title PhlimboEA
- * @notice Staking yield farm for phUSD tokens with EMA-smoothed reward distribution
- * @dev Receives rewards from yield-accumulator contract and distributes them smoothly using EMA algorithm
+ * @notice Staking yield farm for phUSD tokens with Linear Depletion reward distribution
+ * @dev Receives rewards from yield-accumulator contract and distributes them using linear depletion model
  */
 contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
     using SafeERC20 for IERC20;
@@ -47,14 +47,14 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
     /// @notice Whether a set operation is pending confirmation
     bool public apySetInProgress;
 
-    /// @notice Timestamp of last reward collection from yield-accumulator
-    uint256 public lastClaimTimestamp;
+    /// @notice Total undistributed reward tokens (not yet accrued to stakers)
+    uint256 public rewardBalance;
 
-    /// @notice EMA-smoothed stable reward rate per second (scaled by PRECISION)
-    uint256 public smoothedStablePerSecond;
+    /// @notice Target time window to fully distribute rewards (e.g., 604800 = 1 week)
+    uint256 public depletionDuration;
 
-    /// @notice EMA alpha parameter for smoothing (scaled by PRECISION, e.g., 0.1e18 = 10% weight on new rate)
-    uint256 public alpha;
+    /// @notice Current reward rate per second (scaled by PRECISION)
+    uint256 public rewardPerSecond;
 
     /// @notice Timestamp of last reward update
     uint256 public lastRewardTime;
@@ -102,13 +102,16 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
     // Note: Events are declared in IPhlimbo interface
 
     /// @notice Emitted when rewards are collected from yield-accumulator
-    event RewardCollected(uint256 amount, uint256 instantRate, uint256 newSmoothedRate);
+    event RewardCollected(uint256 amount, uint256 newRewardBalance, uint256 newRate);
 
     /// @notice Emitted when yield accumulator address is updated
     event YieldAccumulatorUpdated(address indexed oldAccumulator, address indexed newAccumulator);
 
-    /// @notice Emitted when alpha parameter is updated
-    event AlphaUpdated(uint256 oldAlpha, uint256 newAlpha);
+    /// @notice Emitted when reward rate is updated
+    event RateUpdated(uint256 newRate, uint256 newBalance);
+
+    /// @notice Emitted when depletion duration is updated
+    event DepletionDurationUpdated(uint256 oldDuration, uint256 newDuration);
 
     /// @notice Emitted when an APY change is proposed (preview step)
     event IntendedSetAPY(uint256 indexed proposedAPY, uint256 blockNumber, address indexed proposer);
@@ -123,26 +126,26 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
      * @param _phUSD Address of the phUSD token
      * @param _rewardToken Address of the stable token for rewards (received from yield-accumulator)
      * @param _yieldAccumulator Address of the yield accumulator contract
-     * @param _alpha EMA alpha parameter (scaled by 1e18, e.g., 0.1e18 = 10%)
+     * @param _depletionDuration Target time window to distribute rewards (e.g., 604800 = 1 week)
      */
     constructor(
         address _phUSD,
         address _rewardToken,
         address _yieldAccumulator,
-        uint256 _alpha
+        uint256 _depletionDuration
     ) Ownable(msg.sender) {
         require(_phUSD != address(0), "Invalid phUSD address");
         require(_rewardToken != address(0), "Invalid reward token address");
         require(_yieldAccumulator != address(0), "Invalid yield accumulator address");
-        require(_alpha > 0 && _alpha <= PRECISION, "Alpha must be between 0 and 1e18");
+        require(_depletionDuration > 0, "Duration must be > 0");
 
         phUSD = IFlax(_phUSD);
         rewardToken = IERC20(_rewardToken);
         yieldAccumulator = _yieldAccumulator;
-        alpha = _alpha;
+        depletionDuration = _depletionDuration;
         lastRewardTime = block.timestamp;
-        lastClaimTimestamp = block.timestamp; // Initialize to current time to prevent epoch-sized deltaTime on first claim
-        smoothedStablePerSecond = 0; // Will converge after first few claims
+        rewardBalance = 0;
+        rewardPerSecond = 0;
     }
 
     // ========================== ADMIN FUNCTIONS ==========================
@@ -189,14 +192,22 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
     }
 
     /**
-     * @notice Sets the EMA alpha parameter
-     * @param _alpha New alpha value (scaled by 1e18)
+     * @notice Sets the depletion duration for reward distribution
+     * @param _duration New depletion duration in seconds
      */
-    function setAlpha(uint256 _alpha) external onlyOwner {
-        require(_alpha > 0 && _alpha <= PRECISION, "Alpha must be between 0 and 1e18");
-        uint256 oldAlpha = alpha;
-        alpha = _alpha;
-        emit AlphaUpdated(oldAlpha, _alpha);
+    function setDepletionDuration(uint256 _duration) external onlyOwner {
+        require(_duration > 0, "Duration must be > 0");
+
+        // Accrue pending rewards with old rate before changing duration
+        _updatePool();
+
+        uint256 oldDuration = depletionDuration;
+        depletionDuration = _duration;
+
+        // Recalculate rate with new duration
+        rewardPerSecond = (rewardBalance * PRECISION) / depletionDuration;
+
+        emit DepletionDurationUpdated(oldDuration, _duration);
     }
 
     /**
@@ -222,13 +233,13 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
      */
     function emergencyTransfer(address recipient) external onlyOwner {
         uint256 phUSDBalance = phUSD.balanceOf(address(this));
-        uint256 rewardBalance = rewardToken.balanceOf(address(this));
+        uint256 rewardTokenBalance = rewardToken.balanceOf(address(this));
 
         if (phUSDBalance > 0) {
             IERC20(address(phUSD)).safeTransfer(recipient, phUSDBalance);
         }
-        if (rewardBalance > 0) {
-            rewardToken.safeTransfer(recipient, rewardBalance);
+        if (rewardTokenBalance > 0) {
+            rewardToken.safeTransfer(recipient, rewardTokenBalance);
         }
 
         // Pause the contract to prevent further interactions
@@ -272,42 +283,27 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
     // ========================== REWARD COLLECTION ==========================
 
     /**
-     * @notice Collects rewards from yield-accumulator and updates EMA-smoothed rate
+     * @notice Collects rewards from yield-accumulator and updates linear depletion rate
      * @dev Can only be called by the yield accumulator contract
      * @param amount Amount of reward tokens to collect
      */
     function collectReward(uint256 amount) external {
         require(msg.sender == yieldAccumulator, "Only yield accumulator can call");
         require(amount > 0, "Amount must be greater than 0");
-        require(block.timestamp > lastClaimTimestamp, "Cannot claim in same block");
+
+        // Update pool FIRST to accrue pending rewards before adding new balance
+        _updatePool();
 
         // Pull tokens from yield-accumulator
         rewardToken.safeTransferFrom(msg.sender, address(this), amount);
 
-        // Calculate time delta since last claim
-        uint256 deltaTime = block.timestamp - lastClaimTimestamp;
+        // Add to reward balance
+        rewardBalance += amount;
 
-        // Calculate instant rate with 1e18 precision
-        uint256 instantRate = (amount * PRECISION) / deltaTime;
+        // Recalculate rate based on new balance
+        rewardPerSecond = (rewardBalance * PRECISION) / depletionDuration;
 
-        // Update smoothed rate using EMA formula
-        // smoothedStablePerSecond = (alpha * instantRate + (1e18 - alpha) * smoothedStablePerSecond) / 1e18
-        if (smoothedStablePerSecond == 0) {
-            // First claim - initialize with instant rate
-            smoothedStablePerSecond = instantRate;
-        } else {
-            uint256 alphaWeight = (alpha * instantRate) / PRECISION;
-            uint256 historyWeight = ((PRECISION - alpha) * smoothedStablePerSecond) / PRECISION;
-            smoothedStablePerSecond = alphaWeight + historyWeight;
-        }
-
-        // Update last claim timestamp
-        lastClaimTimestamp = block.timestamp;
-
-        // Update pool to accrue rewards based on new rate
-        _updatePool();
-
-        emit RewardCollected(amount, instantRate, smoothedStablePerSecond);
+        emit RewardCollected(amount, rewardBalance, rewardPerSecond);
     }
 
     // ========================== CORE STAKING FUNCTIONS ==========================
@@ -408,8 +404,8 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
     // ========================== INTERNAL FUNCTIONS ==========================
 
     /**
-     * @notice Updates pool accumulators based on EMA-smoothed reward rate
-     * @dev Accrues stable rewards based on smoothedStablePerSecond, capped by actual pot balance
+     * @notice Updates pool accumulators based on linear depletion reward rate
+     * @dev Accrues stable rewards based on rewardPerSecond, capped by rewardBalance
      */
     function _updatePool() internal {
         if (block.timestamp <= lastRewardTime) {
@@ -424,27 +420,21 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
         // Calculate time elapsed since last update
         uint256 timeElapsed = block.timestamp - lastRewardTime;
 
-        // Calculate potential stable reward based on smoothed rate
-        uint256 potentialReward = (smoothedStablePerSecond * timeElapsed) / PRECISION;
+        // Calculate potential stable reward based on current rate
+        uint256 potentialReward = (rewardPerSecond * timeElapsed) / PRECISION;
 
-        // Get current pot balance (reward tokens in contract)
-        uint256 potBalance = rewardToken.balanceOf(address(this));
-
-        // If rewardToken is the same as phUSD (staked token), subtract staked amount
-        if (address(rewardToken) == address(phUSD)) {
-            if (potBalance > totalStaked) {
-                potBalance -= totalStaked;
-            } else {
-                potBalance = 0;
-            }
-        }
-
-        // Cap distribution by actual pot balance to prevent over-distribution
-        uint256 toDistribute = potentialReward > potBalance ? potBalance : potentialReward;
+        // Cap distribution by rewardBalance to prevent over-distribution
+        uint256 toDistribute = potentialReward > rewardBalance ? rewardBalance : potentialReward;
 
         // Update accumulated stable per share
         if (toDistribute > 0) {
             accStablePerShare += (toDistribute * PRECISION) / totalStaked;
+
+            // Decrease rewardBalance by distributed amount
+            rewardBalance -= toDistribute;
+
+            // Recalculate rate after balance decrease
+            rewardPerSecond = (rewardBalance * PRECISION) / depletionDuration;
         }
 
         // Update phUSD rewards (if phUSDPerSecond is set)
@@ -531,13 +521,10 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
 
         if (block.timestamp > lastRewardTime && totalStaked != 0) {
             uint256 timeElapsed = block.timestamp - lastRewardTime;
-            uint256 potentialReward = (smoothedStablePerSecond * timeElapsed) / PRECISION;
+            uint256 potentialReward = (rewardPerSecond * timeElapsed) / PRECISION;
 
-            // Get pot balance and cap distribution
-            uint256 potBalance = rewardToken.balanceOf(address(this));
-
-            // Cap by available balance
-            uint256 toDistribute = potentialReward > potBalance ? potBalance : potentialReward;
+            // Cap by rewardBalance
+            uint256 toDistribute = potentialReward > rewardBalance ? rewardBalance : potentialReward;
 
             if (toDistribute > 0) {
                 _accStablePerShare += (toDistribute * PRECISION) / totalStaked;
