@@ -49,12 +49,6 @@ interface IPhlimbo {
     function setDesiredAPY(uint256 bps) external;
 
     /**
-     * @notice Sets the yield accumulator address
-     * @param _yieldAccumulator New yield accumulator address
-     */
-    function setYieldAccumulator(address _yieldAccumulator) external;
-
-    /**
      * @notice Sets the depletion duration for reward distribution
      * @param _duration New depletion duration in seconds
      */
@@ -82,8 +76,8 @@ interface IPhlimbo {
     // ========================== REWARD COLLECTION ==========================
 
     /**
-     * @notice Collects rewards from yield-accumulator and updates linear depletion rate
-     * @dev Can only be called by the yield accumulator contract
+     * @notice Collects rewards and updates linear depletion rate
+     * @dev Anyone with approved tokens can contribute rewards
      * @param amount Amount of reward tokens to collect
      */
     function collectReward(uint256 amount) external;
@@ -144,7 +138,6 @@ interface IPhlimbo {
 
     function phUSD() external view returns (IFlax);
     function rewardToken() external view returns (IERC20);
-    function yieldAccumulator() external view returns (address);
     function desiredAPYBps() external view returns (uint256);
     function phUSDPerSecond() external view returns (uint256);
     function rewardBalance() external view returns (uint256);

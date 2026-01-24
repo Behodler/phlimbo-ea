@@ -5,14 +5,6 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "../src/IFlax.sol";
 
 /**
- * @title MockYieldAccumulator
- * @notice Mock implementation of yield accumulator for testing
- */
-contract MockYieldAccumulator {
-    // Mock implementation - can be used to test collectReward calls
-}
-
-/**
  * @title MockFlax
  * @notice Mock implementation of IFlax for testing
  */

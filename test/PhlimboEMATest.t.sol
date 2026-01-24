@@ -12,7 +12,6 @@ import "./Mocks.sol";
 contract PhlimboLinearDepletionTest is Test {
     // Re-declare events for use in expectEmit
     event RewardCollected(uint256 amount, uint256 newRewardBalance, uint256 newRate);
-    event YieldAccumulatorUpdated(address indexed oldAccumulator, address indexed newAccumulator);
     event RateUpdated(uint256 newRate, uint256 newBalance);
     event DepletionDurationUpdated(uint256 oldDuration, uint256 newDuration);
     event EmergencyWithdrawal(address indexed user, uint256 amount);
@@ -25,11 +24,11 @@ contract PhlimboLinearDepletionTest is Test {
     PhlimboEA public phlimbo;
     MockFlax public phUSD;
     MockStable public rewardToken;
-    MockYieldAccumulator public yieldAccumulator;
 
     address public owner = address(this);
     address public alice = address(0x1);
     address public bob = address(0x2);
+    address public rewardDonor = address(0x3);
     address public pauser = address(0x4);
 
     uint256 constant INITIAL_BALANCE = 10000 ether;
@@ -40,13 +39,11 @@ contract PhlimboLinearDepletionTest is Test {
         // Deploy mock contracts
         phUSD = new MockFlax();
         rewardToken = new MockStable();
-        yieldAccumulator = new MockYieldAccumulator();
 
-        // Deploy Phlimbo with new constructor
+        // Deploy Phlimbo with new constructor (no yieldAccumulator parameter)
         phlimbo = new PhlimboEA(
             address(phUSD),
             address(rewardToken),
-            address(yieldAccumulator),
             DEPLETION_DURATION
         );
 
@@ -56,7 +53,7 @@ contract PhlimboLinearDepletionTest is Test {
         // Mint initial tokens
         phUSD.mint(alice, INITIAL_BALANCE);
         phUSD.mint(bob, INITIAL_BALANCE);
-        rewardToken.mint(address(yieldAccumulator), INITIAL_BALANCE);
+        rewardToken.mint(rewardDonor, INITIAL_BALANCE);
 
         // Approve Phlimbo to spend tokens
         vm.prank(alice);
@@ -64,8 +61,8 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(bob);
         phUSD.approve(address(phlimbo), type(uint256).max);
 
-        // Approve Phlimbo to pull reward tokens from yield accumulator
-        vm.prank(address(yieldAccumulator));
+        // Approve Phlimbo to pull reward tokens from reward donor
+        vm.prank(rewardDonor);
         rewardToken.approve(address(phlimbo), type(uint256).max);
 
         // Set up pauser
@@ -77,7 +74,6 @@ contract PhlimboLinearDepletionTest is Test {
     function test_constructor_sets_initial_state() public {
         assertEq(address(phlimbo.phUSD()), address(phUSD), "phUSD should be set");
         assertEq(address(phlimbo.rewardToken()), address(rewardToken), "rewardToken should be set");
-        assertEq(phlimbo.yieldAccumulator(), address(yieldAccumulator), "yieldAccumulator should be set");
         assertEq(phlimbo.depletionDuration(), DEPLETION_DURATION, "depletionDuration should be set");
         assertEq(phlimbo.rewardBalance(), 0, "rewardBalance should start at 0");
         assertEq(phlimbo.rewardPerSecond(), 0, "rewardPerSecond should start at 0");
@@ -85,18 +81,15 @@ contract PhlimboLinearDepletionTest is Test {
 
     function test_constructor_rejects_zero_addresses() public {
         vm.expectRevert("Invalid phUSD address");
-        new PhlimboEA(address(0), address(rewardToken), address(yieldAccumulator), DEPLETION_DURATION);
+        new PhlimboEA(address(0), address(rewardToken), DEPLETION_DURATION);
 
         vm.expectRevert("Invalid reward token address");
-        new PhlimboEA(address(phUSD), address(0), address(yieldAccumulator), DEPLETION_DURATION);
-
-        vm.expectRevert("Invalid yield accumulator address");
-        new PhlimboEA(address(phUSD), address(rewardToken), address(0), DEPLETION_DURATION);
+        new PhlimboEA(address(phUSD), address(0), DEPLETION_DURATION);
     }
 
     function test_constructor_rejects_zero_duration() public {
         vm.expectRevert("Duration must be > 0");
-        new PhlimboEA(address(phUSD), address(rewardToken), address(yieldAccumulator), 0);
+        new PhlimboEA(address(phUSD), address(rewardToken), 0);
     }
 
     // ========================== STAKING TESTS ==========================
@@ -173,27 +166,33 @@ contract PhlimboLinearDepletionTest is Test {
 
     function test_collectReward_pulls_tokens_via_transferFrom() public {
         uint256 rewardAmount = 100 ether;
-        uint256 accumBefore = rewardToken.balanceOf(address(yieldAccumulator));
+        uint256 donorBefore = rewardToken.balanceOf(rewardDonor);
         uint256 phlimboBefore = rewardToken.balanceOf(address(phlimbo));
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(rewardAmount);
 
-        uint256 accumAfter = rewardToken.balanceOf(address(yieldAccumulator));
+        uint256 donorAfter = rewardToken.balanceOf(rewardDonor);
         uint256 phlimboAfter = rewardToken.balanceOf(address(phlimbo));
 
-        assertEq(accumBefore - accumAfter, rewardAmount, "Tokens should be pulled from accumulator");
+        assertEq(donorBefore - donorAfter, rewardAmount, "Tokens should be pulled from donor");
         assertEq(phlimboAfter - phlimboBefore, rewardAmount, "Tokens should be received by Phlimbo");
     }
 
-    function test_collectReward_only_yield_accumulator_can_call() public {
+    function test_collectReward_allows_any_caller_with_approved_tokens() public {
+        // Alice can call collectReward if she has tokens and approval
+        rewardToken.mint(alice, 100 ether);
         vm.prank(alice);
-        vm.expectRevert("Only yield accumulator can call");
+        rewardToken.approve(address(phlimbo), type(uint256).max);
+
+        vm.prank(alice);
         phlimbo.collectReward(100 ether);
+
+        assertEq(phlimbo.rewardBalance(), 100 ether, "Reward balance should increase");
     }
 
     function test_collectReward_rejects_zero_amount() public {
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         vm.expectRevert("Amount must be greater than 0");
         phlimbo.collectReward(0);
     }
@@ -201,7 +200,7 @@ contract PhlimboLinearDepletionTest is Test {
     function test_collectReward_increases_balance_and_rate() public {
         uint256 rewardAmount = 100 ether;
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(rewardAmount);
 
         // Check balance increased
@@ -215,7 +214,7 @@ contract PhlimboLinearDepletionTest is Test {
     function test_rate_equals_balance_divided_by_duration() public {
         uint256 rewardAmount = 100 ether;
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(rewardAmount);
 
         uint256 expectedRate = (rewardAmount * 1e18) / DEPLETION_DURATION;
@@ -230,7 +229,7 @@ contract PhlimboLinearDepletionTest is Test {
         vm.expectEmit(false, false, false, false);
         emit RewardCollected(0, 0, 0);
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(rewardAmount);
     }
 
@@ -241,7 +240,7 @@ contract PhlimboLinearDepletionTest is Test {
 
         // Collect rewards (use smaller amount that fits in initial balance)
         uint256 rewardAmount = 100 ether;
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(rewardAmount);
 
         uint256 balanceBefore = phlimbo.rewardBalance();
@@ -269,7 +268,7 @@ contract PhlimboLinearDepletionTest is Test {
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Collect initial rewards (use amount within balance)
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         uint256 initialBalance = phlimbo.rewardBalance();
@@ -299,7 +298,6 @@ contract PhlimboLinearDepletionTest is Test {
         PhlimboEA phlimboA = new PhlimboEA(
             address(phUSD),
             address(rewardToken),
-            address(yieldAccumulator),
             DEPLETION_DURATION
         );
 
@@ -307,7 +305,6 @@ contract PhlimboLinearDepletionTest is Test {
         PhlimboEA phlimboB = new PhlimboEA(
             address(phUSD),
             address(rewardToken),
-            address(yieldAccumulator),
             DEPLETION_DURATION
         );
 
@@ -315,19 +312,19 @@ contract PhlimboLinearDepletionTest is Test {
         phUSD.setMinter(address(phlimboA), true);
         phUSD.setMinter(address(phlimboB), true);
 
-        // Approve both contracts to pull reward tokens from yield accumulator
-        vm.startPrank(address(yieldAccumulator));
+        // Approve both contracts to pull reward tokens from reward donor
+        vm.startPrank(rewardDonor);
         rewardToken.approve(address(phlimboA), type(uint256).max);
         rewardToken.approve(address(phlimboB), type(uint256).max);
         vm.stopPrank();
 
         // Scenario A: Single 100 ether collection
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimboA.collectReward(100 ether);
 
         // Scenario B: 10 x 10 ether collections
         for (uint i = 0; i < 10; i++) {
-            vm.prank(address(yieldAccumulator));
+            vm.prank(rewardDonor);
             phlimboB.collectReward(10 ether);
         }
 
@@ -348,8 +345,8 @@ contract PhlimboLinearDepletionTest is Test {
         uint256 weeklyYield = 100 ether;
 
         // Collect initial rewards
-        rewardToken.mint(address(yieldAccumulator), weeklyYield);
-        vm.prank(address(yieldAccumulator));
+        rewardToken.mint(rewardDonor, weeklyYield);
+        vm.prank(rewardDonor);
         phlimbo.collectReward(weeklyYield);
 
         uint256 initialRate = phlimbo.rewardPerSecond();
@@ -386,28 +383,26 @@ contract PhlimboLinearDepletionTest is Test {
         PhlimboEA phlimboShort = new PhlimboEA(
             address(phUSD),
             address(rewardToken),
-            address(yieldAccumulator),
             shortDuration
         );
 
         PhlimboEA phlimboLong = new PhlimboEA(
             address(phUSD),
             address(rewardToken),
-            address(yieldAccumulator),
             longDuration
         );
 
         phUSD.setMinter(address(phlimboShort), true);
         phUSD.setMinter(address(phlimboLong), true);
 
-        // Approve both contracts to pull reward tokens from yield accumulator
-        vm.startPrank(address(yieldAccumulator));
+        // Approve both contracts to pull reward tokens from reward donor
+        vm.startPrank(rewardDonor);
         rewardToken.approve(address(phlimboShort), type(uint256).max);
         rewardToken.approve(address(phlimboLong), type(uint256).max);
         vm.stopPrank();
 
         // Both receive same amount of rewards
-        vm.startPrank(address(yieldAccumulator));
+        vm.startPrank(rewardDonor);
         phlimboShort.collectReward(100 ether);
         phlimboLong.collectReward(100 ether);
         vm.stopPrank();
@@ -428,7 +423,7 @@ contract PhlimboLinearDepletionTest is Test {
     function test_first_collection_sets_correct_rate() public {
         uint256 rewardAmount = 100 ether;
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(rewardAmount);
 
         uint256 expectedRate = (rewardAmount * 1e18) / DEPLETION_DURATION;
@@ -445,7 +440,7 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(1 ether);
 
         // Wait long enough for full depletion
@@ -465,7 +460,7 @@ contract PhlimboLinearDepletionTest is Test {
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Small reward
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(1 ether);
 
         // Wait much longer than depletion duration
@@ -485,7 +480,7 @@ contract PhlimboLinearDepletionTest is Test {
 
         // Small reward
         uint256 rewardAmount = 1 ether;
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(rewardAmount);
 
         // Wait much longer than needed to distribute all rewards
@@ -510,7 +505,7 @@ contract PhlimboLinearDepletionTest is Test {
 
     function test_setDepletionDuration_updates_rate() public {
         // Collect initial rewards
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         uint256 rateBefore = phlimbo.rewardPerSecond();
@@ -542,30 +537,6 @@ contract PhlimboLinearDepletionTest is Test {
         emit DepletionDurationUpdated(DEPLETION_DURATION, newDuration);
 
         phlimbo.setDepletionDuration(newDuration);
-    }
-
-    // ========================== YIELD ACCUMULATOR TESTS ==========================
-
-    function test_setYieldAccumulator_updates_address() public {
-        address newAccumulator = address(0x999);
-
-        vm.expectEmit(true, true, false, false);
-        emit YieldAccumulatorUpdated(address(yieldAccumulator), newAccumulator);
-
-        phlimbo.setYieldAccumulator(newAccumulator);
-
-        assertEq(phlimbo.yieldAccumulator(), newAccumulator, "Should update accumulator");
-    }
-
-    function test_setYieldAccumulator_only_owner() public {
-        vm.prank(alice);
-        vm.expectRevert();
-        phlimbo.setYieldAccumulator(address(0x999));
-    }
-
-    function test_setYieldAccumulator_rejects_zero_address() public {
-        vm.expectRevert("Invalid address");
-        phlimbo.setYieldAccumulator(address(0));
     }
 
     // ========================== PAUSE MECHANISM TESTS ==========================
@@ -665,7 +636,7 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         vm.warp(block.timestamp + 100);
@@ -690,7 +661,7 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         vm.warp(block.timestamp + 100);
@@ -736,7 +707,7 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         vm.warp(block.timestamp + 100);
@@ -780,7 +751,7 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(bob);
         phlimbo.stake(STAKE_AMOUNT / 2, address(0));
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         vm.warp(block.timestamp + 100);
@@ -875,7 +846,7 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         // Very large time gap
@@ -890,13 +861,13 @@ contract PhlimboLinearDepletionTest is Test {
 
     function test_multiple_sequential_claims() public {
         // Multiple collections should all work
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(10 ether);
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(20 ether);
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(30 ether);
 
         assertEq(phlimbo.rewardBalance(), 60 ether, "Should accumulate all collections");
@@ -1092,7 +1063,7 @@ contract PhlimboLinearDepletionTest is Test {
         phlimbo.stake(attackerStake, address(0));
 
         uint256 largeReward = 1000 ether;
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(largeReward);
 
         // Wait a significant period for rewards to accrue
@@ -1104,8 +1075,8 @@ contract PhlimboLinearDepletionTest is Test {
 
         // Wait more time for both to accrue rewards
         vm.warp(block.timestamp + 1 days);
-        rewardToken.mint(address(yieldAccumulator), 1000 ether);
-        vm.prank(address(yieldAccumulator));
+        rewardToken.mint(rewardDonor, 1000 ether);
+        vm.prank(rewardDonor);
         phlimbo.collectReward(1000 ether);
 
         vm.warp(block.timestamp + 1 days);
@@ -1146,14 +1117,14 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         vm.prank(alice);
         phlimbo.claim();
 
-        rewardToken.mint(address(yieldAccumulator), 5000 ether);
-        vm.prank(address(yieldAccumulator));
+        rewardToken.mint(rewardDonor, 5000 ether);
+        vm.prank(rewardDonor);
         phlimbo.collectReward(5000 ether);
 
         vm.prank(alice);
@@ -1181,14 +1152,14 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         vm.prank(alice);
         phlimbo.claim();
 
-        rewardToken.mint(address(yieldAccumulator), 5000 ether);
-        vm.prank(address(yieldAccumulator));
+        rewardToken.mint(rewardDonor, 5000 ether);
+        vm.prank(rewardDonor);
         phlimbo.collectReward(5000 ether);
 
         vm.prank(alice);
@@ -1477,8 +1448,8 @@ contract PhlimboLinearDepletionTest is Test {
         vm.roll(block.number + 1);
         phlimbo.setDesiredAPY(800);
 
-        rewardToken.mint(address(yieldAccumulator), 10000 ether);
-        vm.prank(address(yieldAccumulator));
+        rewardToken.mint(rewardDonor, 10000 ether);
+        vm.prank(rewardDonor);
         phlimbo.collectReward(10000 ether);
 
         vm.prank(alice);
@@ -1509,8 +1480,8 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        rewardToken.mint(address(yieldAccumulator), 10000 ether);
-        vm.prank(address(yieldAccumulator));
+        rewardToken.mint(rewardDonor, 10000 ether);
+        vm.prank(rewardDonor);
         phlimbo.collectReward(10000 ether);
 
         vm.prank(alice);
@@ -1525,8 +1496,8 @@ contract PhlimboLinearDepletionTest is Test {
         vm.roll(block.number + 1);
         phlimbo.setDesiredAPY(800);
 
-        rewardToken.mint(address(yieldAccumulator), 10000 ether);
-        vm.prank(address(yieldAccumulator));
+        rewardToken.mint(rewardDonor, 10000 ether);
+        vm.prank(rewardDonor);
         phlimbo.collectReward(10000 ether);
 
         vm.prank(alice);
@@ -1541,8 +1512,8 @@ contract PhlimboLinearDepletionTest is Test {
         vm.roll(block.number + 1);
         phlimbo.setDesiredAPY(800);
 
-        rewardToken.mint(address(yieldAccumulator), 10000 ether);
-        vm.prank(address(yieldAccumulator));
+        rewardToken.mint(rewardDonor, 10000 ether);
+        vm.prank(rewardDonor);
         phlimbo.collectReward(10000 ether);
 
         vm.prank(alice);
@@ -1610,9 +1581,9 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        rewardToken.mint(address(yieldAccumulator), 10000 ether);
+        rewardToken.mint(rewardDonor, 10000 ether);
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         // Wait some time for rewards to accrue
@@ -1641,8 +1612,8 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        rewardToken.mint(address(yieldAccumulator), 10000 ether);
-        vm.prank(address(yieldAccumulator));
+        rewardToken.mint(rewardDonor, 10000 ether);
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         vm.prank(alice);
@@ -1651,7 +1622,7 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         vm.prank(alice);
@@ -1706,7 +1677,7 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         uint256 accStableBefore = phlimbo.accStablePerShare();
@@ -1726,7 +1697,7 @@ contract PhlimboLinearDepletionTest is Test {
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // Small reward to start
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(1 ether);
 
         // Wait much longer than needed to fully distribute
@@ -1747,7 +1718,7 @@ contract PhlimboLinearDepletionTest is Test {
     function test_updatePool_handles_totalStaked_zero() public {
         assertEq(phlimbo.totalStaked(), 0, "No stakers initially");
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         assertEq(phlimbo.accStablePerShare(), 0, "No accumulation when no stakers");
@@ -1759,9 +1730,9 @@ contract PhlimboLinearDepletionTest is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
-        rewardToken.mint(address(yieldAccumulator), 100 ether);
+        rewardToken.mint(rewardDonor, 100 ether);
 
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
 
         // Wait some time for rewards to accrue
@@ -1782,12 +1753,12 @@ contract PhlimboLinearDepletionTest is Test {
         phlimbo.stake(STAKE_AMOUNT, address(0));
 
         // First collection
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
         uint256 rate1 = phlimbo.rewardPerSecond();
 
         // Second collection with different amount
-        vm.prank(address(yieldAccumulator));
+        vm.prank(rewardDonor);
         phlimbo.collectReward(100 ether);
         uint256 rate2 = phlimbo.rewardPerSecond();
 
