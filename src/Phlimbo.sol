@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./IFlax.sol";
@@ -14,7 +15,7 @@ import {IPausable} from "lib/mutable/pauser/src/interfaces/IPausable.sol";
  * @notice Staking yield farm for phUSD tokens with Linear Depletion reward distribution
  * @dev Receives rewards from yield-accumulator contract and distributes them using linear depletion model
  */
-contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
+contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
     using SafeERC20 for IERC20;
 
     // ========================== STATE VARIABLES ==========================
@@ -24,9 +25,6 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
 
     /// @notice External stablecoin token distributed as rewards (received from yield-accumulator)
     IERC20 public rewardToken;
-
-    /// @notice Address of the yield accumulator contract authorized to call collectReward
-    address public yieldAccumulator;
 
     /// @notice Address authorized to pause the contract
     address public override pauser;
@@ -104,9 +102,6 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
     /// @notice Emitted when rewards are collected from yield-accumulator
     event RewardCollected(uint256 amount, uint256 newRewardBalance, uint256 newRate);
 
-    /// @notice Emitted when yield accumulator address is updated
-    event YieldAccumulatorUpdated(address indexed oldAccumulator, address indexed newAccumulator);
-
     /// @notice Emitted when reward rate is updated
     event RateUpdated(uint256 newRate, uint256 newBalance);
 
@@ -125,23 +120,19 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
      * @notice Initializes the Phlimbo staking contract
      * @param _phUSD Address of the phUSD token
      * @param _rewardToken Address of the stable token for rewards (received from yield-accumulator)
-     * @param _yieldAccumulator Address of the yield accumulator contract
      * @param _depletionDuration Target time window to distribute rewards (e.g., 604800 = 1 week)
      */
     constructor(
         address _phUSD,
         address _rewardToken,
-        address _yieldAccumulator,
         uint256 _depletionDuration
     ) Ownable(msg.sender) {
         require(_phUSD != address(0), "Invalid phUSD address");
         require(_rewardToken != address(0), "Invalid reward token address");
-        require(_yieldAccumulator != address(0), "Invalid yield accumulator address");
         require(_depletionDuration > 0, "Duration must be > 0");
 
         phUSD = IFlax(_phUSD);
         rewardToken = IERC20(_rewardToken);
-        yieldAccumulator = _yieldAccumulator;
         depletionDuration = _depletionDuration;
         lastRewardTime = block.timestamp;
         rewardBalance = 0;
@@ -178,17 +169,6 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
             emit DesiredAPYUpdated(oldAPY, bps);
             apySetInProgress = false;
         }
-    }
-
-    /**
-     * @notice Sets the yield accumulator address
-     * @param _yieldAccumulator New yield accumulator address
-     */
-    function setYieldAccumulator(address _yieldAccumulator) external onlyOwner {
-        require(_yieldAccumulator != address(0), "Invalid address");
-        address oldAccumulator = yieldAccumulator;
-        yieldAccumulator = _yieldAccumulator;
-        emit YieldAccumulatorUpdated(oldAccumulator, _yieldAccumulator);
     }
 
     /**
@@ -283,12 +263,11 @@ contract PhlimboEA is Ownable, Pausable, IPhlimbo, IPausable {
     // ========================== REWARD COLLECTION ==========================
 
     /**
-     * @notice Collects rewards from yield-accumulator and updates linear depletion rate
-     * @dev Can only be called by the yield accumulator contract
+     * @notice Collects rewards and updates linear depletion rate
+     * @dev Anyone with approved tokens can contribute rewards
      * @param amount Amount of reward tokens to collect
      */
-    function collectReward(uint256 amount) external {
-        require(msg.sender == yieldAccumulator, "Only yield accumulator can call");
+    function collectReward(uint256 amount) external nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
 
         // Update pool FIRST to accrue pending rewards before adding new balance
