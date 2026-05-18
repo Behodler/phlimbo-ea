@@ -6,6 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a Foundry smart contract submodule for the PhlimboEa contract.
 
+### Contract inventory
+
+- `src/Phlimbo.sol` — `PhlimboEA` (V1, deployed). Linear-depletion staking yield farm. Has the
+  V1 rate-recompute bug: `rewardPerSecond` is recomputed on every `stake`/`withdraw`/`claim`,
+  effectively re-anchoring the depletion window on each user interaction. DO NOT MODIFY.
+- `src/PhlimboV2.sol` — `PhlimboV2` (coexists with V1). Same shape as V1 with three deliberate
+  changes: (1) depletion-rate recompute removed from `_updatePool` so the window does not reset
+  on user interactions, (2) `stake`/`withdraw`/`claim` take an explicit `user` param and a new
+  `migrator` role can act on behalf of any user (`pauseWithdraw` remains msg.sender-only), and
+  (3) an optional `IPhlimboHook` is invoked after stake/withdraw/claim, guarded with a
+  zero-address check so no default no-op hook contract is needed.
+
 ## Dependency Management
 
 ### Types of Dependencies
