@@ -17,6 +17,11 @@ This is a Foundry smart contract submodule for the PhlimboEa contract.
   `migrator` role can act on behalf of any user (`pauseWithdraw` remains msg.sender-only), and
   (3) an optional `IPhlimboHook` is invoked after stake/withdraw/claim, guarded with a
   zero-address check so no default no-op hook contract is needed.
+- `src/MigratorV1V2.sol` — `MigratorV1V2`. One-shot, chunkable migrator that settles V1
+  pending rewards (USDC transferred, phUSD minted) and re-stakes V1 deposits into PhlimboV2
+  via the V2 `migrator` role. Owner-seeded; `int256` iterators terminate at `-1`; owner has a
+  `withdrawAll` escape hatch. Requires two deployment-time wirings (phUSD mint role + V2
+  setMigrator) — both documented inline.
 
 ## Dependency Management
 
