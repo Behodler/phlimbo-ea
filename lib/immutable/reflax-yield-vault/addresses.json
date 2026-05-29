@@ -1,0 +1,20 @@
+{
+  "1": {
+    "name": "Ethereum Mainnet",
+    "contracts": {
+      "DOLA": "0x865377367054516e17014CcdED1e7d814EDC9ce4",
+      "TOKE": "0x2e9d63788249371f1DFC918a52f8d799F4a38C94",
+      "autoDOLA": "0x0538C8bAc84E95A9dF8aC10Aad17DbE81b9E36ee",
+      "MainRewarder": "0x79dD22579112d8a5F7347c5976bC7b9812C2D4EA"
+    }
+  },
+  "11155111": {
+    "name": "Sepolia Testnet",
+    "contracts": {
+      "DOLA": "0x0000000000000000000000000000000000000000",
+      "TOKE": "0x0000000000000000000000000000000000000000",
+      "autoDOLA": "0x0000000000000000000000000000000000000000",
+      "MainRewarder": "0x0000000000000000000000000000000000000000"
+    }
+  }
+}

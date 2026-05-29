@@ -16,10 +16,4 @@ echo "Cloning immutable dependency: $REPO_NAME"
 cd lib/immutable || exit 1
 git clone "$REPO" "$REPO_NAME"
 
-# Vendor the source as plain files: strip the nested .git so the dependency is
-# committed as regular tracked files, NOT as a submodule gitlink. A gitlink with
-# no .gitmodules entry breaks `git submodule update --init --recursive` for any
-# super-repo that consumes this repo as a submodule.
-rm -rf "$REPO_NAME/.git"
-
 echo "Successfully added immutable dependency: $REPO_NAME"
