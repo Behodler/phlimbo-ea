@@ -11,6 +11,11 @@ import "./interfaces/IPhlimbo.sol";
 import {IPausable} from "lib/mutable/pauser/src/interfaces/IPausable.sol";
 
 /**
+NOTE: on mainnet, all users have been migrated from Phlimbo to PhlimboV2, leaving PhlimboV1 inactive. It is safe to delete this contract. 
+Keeping now for reference while writing V3 but this should be removed after V3 ships 
+ */
+
+/**
  * @title PhlimboEA
  * @notice Staking yield farm for phUSD tokens with Linear Depletion reward distribution
  * @dev Receives rewards from yield-accumulator contract and distributes them using linear depletion model
@@ -100,7 +105,11 @@ contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
     // Note: Events are declared in IPhlimbo interface
 
     /// @notice Emitted when rewards are collected from yield-accumulator
-    event RewardCollected(uint256 amount, uint256 newRewardBalance, uint256 newRate);
+    event RewardCollected(
+        uint256 amount,
+        uint256 newRewardBalance,
+        uint256 newRate
+    );
 
     /// @notice Emitted when reward rate is updated
     event RateUpdated(uint256 newRate, uint256 newBalance);
@@ -109,7 +118,11 @@ contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
     event DepletionDurationUpdated(uint256 oldDuration, uint256 newDuration);
 
     /// @notice Emitted when an APY change is proposed (preview step)
-    event IntendedSetAPY(uint256 indexed proposedAPY, uint256 blockNumber, address indexed proposer);
+    event IntendedSetAPY(
+        uint256 indexed proposedAPY,
+        uint256 blockNumber,
+        address indexed proposer
+    );
 
     /// @notice Emitted when an APY change is confirmed (commit step)
     event DesiredAPYUpdated(uint256 oldAPY, uint256 newAPY);
@@ -151,8 +164,8 @@ contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
     function setDesiredAPY(uint256 bps) external onlyOwner {
         // Check if we should treat this as a preview or commit
         bool isPreview = !apySetInProgress ||
-                        block.number > pendingAPYBlockNumber + 100 ||
-                        bps != pendingAPYBps;
+            block.number > pendingAPYBlockNumber + 100 ||
+            bps != pendingAPYBps;
 
         if (isPreview) {
             // PREVIEW BRANCH: Emit intent, store pending state, no actual change
@@ -310,7 +323,11 @@ contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
         }
 
         // Transfer phUSD from msg.sender (caller always pays)
-        IERC20(address(phUSD)).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(address(phUSD)).safeTransferFrom(
+            msg.sender,
+            address(this),
+            amount
+        );
 
         // Update user info
         user.amount += amount;
@@ -403,7 +420,9 @@ contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
         uint256 potentialReward = (rewardPerSecond * timeElapsed) / PRECISION;
 
         // Cap distribution by rewardBalance to prevent over-distribution
-        uint256 toDistribute = potentialReward > rewardBalance ? rewardBalance : potentialReward;
+        uint256 toDistribute = potentialReward > rewardBalance
+            ? rewardBalance
+            : potentialReward;
 
         // Update accumulated stable per share
         if (toDistribute > 0) {
@@ -437,13 +456,17 @@ contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
         }
 
         // Calculate pending phUSD
-        uint256 pendingPhUSDAmount = (userDetails.amount * accPhUSDPerShare) / PRECISION - userDetails.phUSDDebt;
+        uint256 pendingPhUSDAmount = (userDetails.amount * accPhUSDPerShare) /
+            PRECISION -
+            userDetails.phUSDDebt;
         if (pendingPhUSDAmount > 0) {
             phUSD.mint(user, pendingPhUSDAmount);
         }
 
         // Calculate pending reward tokens (stable)
-        uint256 pendingRewardAmount = (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;
+        uint256 pendingRewardAmount = (userDetails.amount * accStablePerShare) /
+            PRECISION -
+            userDetails.stableDebt;
         if (pendingRewardAmount > 0) {
             rewardToken.safeTransfer(user, pendingRewardAmount);
         }
@@ -466,7 +489,10 @@ contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
 
         // Calculate phUSD emission rate
         // phUSDPerSecond = (totalStaked * desiredAPYBps) / 10000 / SECONDS_PER_YEAR
-        phUSDPerSecond = (totalStaked * desiredAPYBps) / 10000 / SECONDS_PER_YEAR;
+        phUSDPerSecond =
+            (totalStaked * desiredAPYBps) /
+            10000 /
+            SECONDS_PER_YEAR;
     }
 
     // ========================== VIEW FUNCTIONS ==========================
@@ -486,7 +512,10 @@ contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
             _accPhUSDPerShare += (phUSDReward * PRECISION) / totalStaked;
         }
 
-        return (userDetails.amount * _accPhUSDPerShare) / PRECISION - userDetails.phUSDDebt;
+        return
+            (userDetails.amount * _accPhUSDPerShare) /
+            PRECISION -
+            userDetails.phUSDDebt;
     }
 
     /**
@@ -500,17 +529,23 @@ contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
 
         if (block.timestamp > lastRewardTime && totalStaked != 0) {
             uint256 timeElapsed = block.timestamp - lastRewardTime;
-            uint256 potentialReward = (rewardPerSecond * timeElapsed) / PRECISION;
+            uint256 potentialReward = (rewardPerSecond * timeElapsed) /
+                PRECISION;
 
             // Cap by rewardBalance
-            uint256 toDistribute = potentialReward > rewardBalance ? rewardBalance : potentialReward;
+            uint256 toDistribute = potentialReward > rewardBalance
+                ? rewardBalance
+                : potentialReward;
 
             if (toDistribute > 0) {
                 _accStablePerShare += (toDistribute * PRECISION) / totalStaked;
             }
         }
 
-        return (userDetails.amount * _accStablePerShare) / PRECISION - userDetails.stableDebt;
+        return
+            (userDetails.amount * _accStablePerShare) /
+            PRECISION -
+            userDetails.stableDebt;
     }
 
     /**
@@ -521,13 +556,17 @@ contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
      * @return _phUSDPerSecond Current emission rate
      * @return _lastRewardTime Last update time
      */
-    function getPoolInfo() external view returns (
-        uint256 _totalStaked,
-        uint256 _accPhUSDPerShare,
-        uint256 _accStablePerShare,
-        uint256 _phUSDPerSecond,
-        uint256 _lastRewardTime
-    ) {
+    function getPoolInfo()
+        external
+        view
+        returns (
+            uint256 _totalStaked,
+            uint256 _accPhUSDPerShare,
+            uint256 _accStablePerShare,
+            uint256 _phUSDPerSecond,
+            uint256 _lastRewardTime
+        )
+    {
         return (
             totalStaked,
             accPhUSDPerShare,
@@ -543,15 +582,15 @@ contract PhlimboEA is Ownable, Pausable, ReentrancyGuard, IPhlimbo, IPausable {
      * @return _pendingAPYBlockNumber The block when APY was proposed
      * @return _apySetInProgress Whether a set operation is pending
      */
-    function getPendingAPYInfo() external view returns (
-        uint256 _pendingAPYBps,
-        uint256 _pendingAPYBlockNumber,
-        bool _apySetInProgress
-    ) {
-        return (
-            pendingAPYBps,
-            pendingAPYBlockNumber,
-            apySetInProgress
-        );
+    function getPendingAPYInfo()
+        external
+        view
+        returns (
+            uint256 _pendingAPYBps,
+            uint256 _pendingAPYBlockNumber,
+            bool _apySetInProgress
+        )
+    {
+        return (pendingAPYBps, pendingAPYBlockNumber, apySetInProgress);
     }
 }
