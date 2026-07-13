@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "./IFlax.sol";
 import "./interfaces/IPhlimboV3.sol";
 import "./interfaces/IPhlimboHook.sol";
@@ -14,23 +15,35 @@ import {IPausable} from "lib/mutable/pauser/src/interfaces/IPausable.sol";
 /**
  * @title PhlimboV3
  * @notice Staking yield farm for phUSD tokens with Linear Depletion reward distribution.
- *         V2 of PhlimboEA — same shape, three deliberate differences:
+ *         V3 = verbatim copy of PhlimboV2 (which fixed the V1 depletion-rate bug and
+ *         added the migrator role + hook system) plus an additive SINGLE promotional
+ *         reward token subsystem:
  *
- *         1. Fixed linear-depletion bug: `rewardPerSecond` is NOT recomputed inside
- *            `_updatePool()`. It is recomputed only in `collectReward()` and
- *            `setDepletionDuration()` so the depletion window does not reset on every
- *            user interaction.
- *         2. Migrator role: `stake`, `withdraw`, `claim` accept an explicit `user`
- *            address. Auth is `msg.sender == user || msg.sender == migrator`.
- *         3. Hook system: optional `IPhlimboHook` is invoked after stake/withdraw/claim.
- *            The contract uses an explicit zero-address guard rather than wiring a
- *            no-op default hook (saves ~2k gas when no hook is configured).
+ *         1. Promo slot: a partner supplies a fixed quantity Q of their token; V3
+ *            streams it linearly over an owner-set window `promoDepletionDuration`
+ *            (independent of the stable `rewardToken` window), falls dormant on
+ *            depletion, reactivates on owner top-up.
+ *         2. Rotation without history: pause → cursor-guaranteed `batchClaim` flush
+ *            over a frozen `EnumerableSet` of stakers → swap token → unpause.
+ *            Two load-bearing invariants:
+ *            (a) `accPromoPerShare` is NEVER reset across promotions — the flush
+ *                aligns every staker's `promoDebt` to the current accumulator, so
+ *                pending against the next token starts at exactly zero.
+ *            (b) The flush is provably complete over a frozen staker set — set
+ *                membership only mutates in `whenNotPaused` ops, and a monotone
+ *                `flushCursor` makes coverage contiguous; `finalizePromotion`
+ *                requires `flushCursor == _stakers.length()`.
+ *         3. Pause deltas from V2: owner may pause/unpause directly (external pauser
+ *            still supported); `unpause()` reverts while flushing; `pauseWithdraw`
+ *            realigns ALL reward debts to the reduced amount (fixes the latent V1/V2
+ *            partial-pauseWithdraw brick, forfeiting unclaimed accruals).
  *
- *         V1 (`PhlimboEA`) remains deployed; V2 coexists for migration. `pauseWithdraw`
- *         is unchanged from V1 — strictly msg.sender-only, not delegatable to migrator.
+ *         V1 (`PhlimboEA`) and V2 remain deployed; V3 coexists for migration.
+ *         `pauseWithdraw` stays strictly msg.sender-only, not delegatable to migrator.
  */
 contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable {
     using SafeERC20 for IERC20;
+    using EnumerableSet for EnumerableSet.AddressSet;
 
     // ========================== STATE VARIABLES ==========================
 
@@ -88,6 +101,42 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     /// @dev Initialized to address(0) — no hook. Guarded with `if (address(hook) != address(0))`.
     IPhlimboHook public hook;
 
+    // ---------- Promotional slot (single) ----------
+
+    /// @notice Current promotional partner token. address(0) = no promotion.
+    IERC20 public promoToken;
+
+    /// @notice Undistributed promo tokens (not yet accrued to stakers)
+    uint256 public promoRewardBalance;
+
+    /// @notice Promo stream's OWN depletion window, independent of `depletionDuration`
+    uint256 public promoDepletionDuration;
+
+    /// @notice Current promo reward rate per second (scaled by PRECISION)
+    uint256 public promoRewardPerSecond;
+
+    /// @notice Accumulated promo rewards per share (scaled by PRECISION).
+    /// @dev NEVER reset across promotions — the flush aligns every staker's
+    ///      `promoDebt` to this accumulator instead. Zeroing it while debts are
+    ///      non-zero would underflow `amount * acc - debt`.
+    uint256 public accPromoPerShare;
+
+    /// @notice Enumerable set of every address with a non-zero staked amount.
+    /// @dev Membership mutates only inside `whenNotPaused` ops, so the set is
+    ///      frozen while paused/flushing (EnumerableSet.remove is swap-and-pop —
+    ///      a mid-flush removal could silently skip a member).
+    EnumerableSet.AddressSet private _stakers;
+
+    /// @notice Rotation state machine phase
+    PromoPhase public promoPhase;
+
+    /// @notice Monotone cursor into `_stakers` during a flush (chunked-iterator idiom)
+    uint256 public flushCursor;
+
+    /// @notice Promo tokens whose transfer to a user failed during flush (banked
+    ///         for out-of-band handling; swept at finalizePromotion)
+    uint256 public unclaimablePromo;
+
     // ========================== CONSTANTS ==========================
 
     /// @notice Precision multiplier for reward calculations
@@ -108,6 +157,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         uint256 amount;
         uint256 phUSDDebt;
         uint256 stableDebt;
+        uint256 promoDebt;
     }
 
     // ========================== MAPPINGS ==========================
@@ -212,9 +262,10 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
     /**
      * @notice Unpauses the contract
+     * @dev V3: owner may unpause directly in addition to the external pauser.
      */
     function unpause() public override {
-        require(msg.sender == pauser, "Only pauser can unpause");
+        require(msg.sender == pauser || msg.sender == owner(), "Only pauser or owner can unpause");
         _unpause();
     }
 
@@ -266,9 +317,10 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
     /**
      * @notice Pauses the contract
+     * @dev V3: owner may pause directly in addition to the external pauser.
      */
     function pause() public override {
-        require(msg.sender == pauser, "Only pauser can pause");
+        require(msg.sender == pauser || msg.sender == owner(), "Only pauser or owner can pause");
         _pause();
     }
 
@@ -276,6 +328,16 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
      * @notice Allows users to withdraw their staked phUSD when contract is paused
      * @dev Emergency exit mechanism — strictly msg.sender-only. NOT delegatable to
      *      migrator. Does NOT claim rewards or update pool. Does NOT invoke any hook.
+     *
+     *      V3 deltas from V2:
+     *      - Realigns ALL reward debts (phUSDDebt/stableDebt/promoDebt) to the
+     *        reduced amount, forfeiting unclaimed accruals. This fixes the latent
+     *        V1/V2 defect where a partial pauseWithdraw left debts computed against
+     *        the old, larger amount, so `amount * acc - debt` underflowed and
+     *        bricked the user's position after unpause.
+     *      - Does NOT touch `_stakers` membership: the set only mutates in
+     *        `whenNotPaused` ops, keeping it frozen during a flush. A user who
+     *        fully exits here is visited by the flush with pending == 0 (harmless).
      */
     function pauseWithdraw(uint256 amount) external whenPaused {
         UserInfo storage user = userInfo[msg.sender];
@@ -284,6 +346,10 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
         user.amount -= amount;
         totalStaked -= amount;
+
+        user.phUSDDebt = (user.amount * accPhUSDPerShare) / PRECISION;
+        user.stableDebt = (user.amount * accStablePerShare) / PRECISION;
+        user.promoDebt = (user.amount * accPromoPerShare) / PRECISION;
 
         IERC20(address(phUSD)).safeTransfer(msg.sender, amount);
 
@@ -343,8 +409,13 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         userDetails.amount += amount;
         userDetails.phUSDDebt = (userDetails.amount * accPhUSDPerShare) / PRECISION;
         userDetails.stableDebt = (userDetails.amount * accStablePerShare) / PRECISION;
+        userDetails.promoDebt = (userDetails.amount * accPromoPerShare) / PRECISION;
 
         totalStaked += amount;
+
+        // Idempotent: `amount >= MINIMUM_STAKE` is guaranteed above, so membership
+        // in `_stakers` ⟺ userInfo.amount > 0 (V2 dust rule preserves this on exit).
+        _stakers.add(user);
 
         _updatePhUSDEmissionRate();
 
@@ -384,8 +455,14 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         userDetails.amount = remaining;
         userDetails.phUSDDebt = (userDetails.amount * accPhUSDPerShare) / PRECISION;
         userDetails.stableDebt = (userDetails.amount * accStablePerShare) / PRECISION;
+        userDetails.promoDebt = (userDetails.amount * accPromoPerShare) / PRECISION;
 
         totalStaked -= actualWithdrawAmount;
+
+        // Full exit (including dust-rule forced full exit) leaves the staker set.
+        if (remaining == 0) {
+            _stakers.remove(user);
+        }
 
         // Transfer phUSD to msg.sender (caller). When the migrator calls on behalf
         // of a user, the migrator wallet receives the tokens.
@@ -555,6 +632,20 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         }
 
         return (userDetails.amount * _accStablePerShare) / PRECISION - userDetails.stableDebt;
+    }
+
+    /**
+     * @notice Number of addresses currently in the staker set
+     */
+    function stakerCount() external view returns (uint256) {
+        return _stakers.length();
+    }
+
+    /**
+     * @notice Staker address at `index` in the staker set
+     */
+    function stakerAt(uint256 index) external view returns (address) {
+        return _stakers.at(index);
     }
 
     /**

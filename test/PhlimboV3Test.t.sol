@@ -109,7 +109,7 @@ contract PhlimboV3Test is Test {
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, alice);
 
-        (uint256 amount,,) = phlimbo.userInfo(alice);
+        (uint256 amount,,,) = phlimbo.userInfo(alice);
         assertEq(amount, STAKE_AMOUNT);
         assertEq(phlimbo.totalStaked(), STAKE_AMOUNT);
     }
@@ -233,14 +233,14 @@ contract PhlimboV3Test is Test {
         phlimbo.stake(STAKE_AMOUNT, alice);
 
         // Alice's userInfo.amount credited
-        (uint256 aliceAmount,,) = phlimbo.userInfo(alice);
+        (uint256 aliceAmount,,,) = phlimbo.userInfo(alice);
         assertEq(aliceAmount, STAKE_AMOUNT, "Alice credited");
 
         // Migrator paid (tokens pulled from msg.sender)
         assertEq(phUSD.balanceOf(migrator), migratorBalanceBefore - STAKE_AMOUNT, "Migrator paid");
 
         // Migrator's own userInfo unchanged
-        (uint256 migratorAmount,,) = phlimbo.userInfo(migrator);
+        (uint256 migratorAmount,,,) = phlimbo.userInfo(migrator);
         assertEq(migratorAmount, 0, "Migrator has no position");
     }
 
@@ -262,7 +262,7 @@ contract PhlimboV3Test is Test {
         // Alice's wallet untouched (her stake was debited internally)
         assertEq(phUSD.balanceOf(alice), aliceBalanceBefore);
         // Alice's user.amount decreased
-        (uint256 aliceAmount,,) = phlimbo.userInfo(alice);
+        (uint256 aliceAmount,,,) = phlimbo.userInfo(alice);
         assertEq(aliceAmount, STAKE_AMOUNT / 2);
     }
 
@@ -360,7 +360,7 @@ contract PhlimboV3Test is Test {
         phlimbo.pauseWithdraw(1 ether);
 
         // Alice's balance untouched
-        (uint256 aliceAmount,,) = phlimbo.userInfo(alice);
+        (uint256 aliceAmount,,,) = phlimbo.userInfo(alice);
         assertEq(aliceAmount, STAKE_AMOUNT);
     }
 
@@ -380,7 +380,7 @@ contract PhlimboV3Test is Test {
         // Default state: hook is address(0). Stake/withdraw/claim must work.
         vm.prank(alice);
         phlimbo.stake(STAKE_AMOUNT, alice);
-        (uint256 amount,,) = phlimbo.userInfo(alice);
+        (uint256 amount,,,) = phlimbo.userInfo(alice);
         assertEq(amount, STAKE_AMOUNT);
     }
 
@@ -389,7 +389,7 @@ contract PhlimboV3Test is Test {
         phlimbo.stake(STAKE_AMOUNT, alice);
         vm.prank(alice);
         phlimbo.withdraw(STAKE_AMOUNT, alice);
-        (uint256 amount,,) = phlimbo.userInfo(alice);
+        (uint256 amount,,,) = phlimbo.userInfo(alice);
         assertEq(amount, 0);
     }
 
@@ -504,7 +504,7 @@ contract PhlimboV3Test is Test {
         phlimbo.stake(STAKE_AMOUNT, alice);
 
         // State must be rolled back: alice not staked
-        (uint256 amount,,) = phlimbo.userInfo(alice);
+        (uint256 amount,,,) = phlimbo.userInfo(alice);
         assertEq(amount, 0, "state rolled back on revert");
         assertEq(phlimbo.totalStaked(), 0);
     }
@@ -521,7 +521,7 @@ contract PhlimboV3Test is Test {
         vm.expectRevert("withdraw blocked");
         phlimbo.withdraw(STAKE_AMOUNT, alice);
 
-        (uint256 amount,,) = phlimbo.userInfo(alice);
+        (uint256 amount,,,) = phlimbo.userInfo(alice);
         assertEq(amount, STAKE_AMOUNT, "state preserved on revert");
     }
 
@@ -716,7 +716,7 @@ contract PhlimboV3Test is Test {
         vm.prank(alice);
         phlimbo.pauseWithdraw(STAKE_AMOUNT);
 
-        (uint256 amount,,) = phlimbo.userInfo(alice);
+        (uint256 amount,,,) = phlimbo.userInfo(alice);
         assertEq(amount, 0);
         assertEq(phUSD.balanceOf(alice), INITIAL_BALANCE);
     }
@@ -767,7 +767,7 @@ contract PhlimboV3Test is Test {
 
         // Full balance withdrawn
         assertEq(phUSD.balanceOf(alice), balanceBefore + STAKE_AMOUNT);
-        (uint256 amount,,) = phlimbo.userInfo(alice);
+        (uint256 amount,,,) = phlimbo.userInfo(alice);
         assertEq(amount, 0);
     }
 
@@ -823,5 +823,192 @@ contract PhlimboV3Test is Test {
         emit Withdrawn(alice, STAKE_AMOUNT);
         vm.prank(migrator);
         phlimbo.withdraw(STAKE_AMOUNT, alice);
+    }
+
+    // ============================================================
+    // V3 PHASE 1: STAKER SET MAINTENANCE
+    // ============================================================
+
+    function test_stakers_set_adds_on_stake_and_is_idempotent() public {
+        assertEq(phlimbo.stakerCount(), 0, "set starts empty");
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        assertEq(phlimbo.stakerCount(), 1, "alice added");
+        assertEq(phlimbo.stakerAt(0), alice);
+
+        // Second stake by the same user must not add a duplicate
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        assertEq(phlimbo.stakerCount(), 1, "idempotent add");
+
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT, bob);
+        assertEq(phlimbo.stakerCount(), 2, "bob added");
+    }
+
+    function test_stakers_set_partial_withdraw_keeps_member() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT / 2, alice);
+
+        assertEq(phlimbo.stakerCount(), 1, "partial withdraw keeps alice in set");
+        assertEq(phlimbo.stakerAt(0), alice);
+    }
+
+    function test_stakers_set_removes_on_full_exit() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT, bob);
+
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT, alice);
+
+        assertEq(phlimbo.stakerCount(), 1, "alice removed on full exit");
+        assertEq(phlimbo.stakerAt(0), bob, "bob remains");
+    }
+
+    function test_stakers_set_removes_on_dust_rule_full_exit() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        // Withdrawing so that 0 < remaining < MINIMUM_STAKE forces a full exit
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT - 1e14, alice);
+
+        (uint256 amount,,,) = phlimbo.userInfo(alice);
+        assertEq(amount, 0, "dust rule forced full exit");
+        assertEq(phlimbo.stakerCount(), 0, "alice removed by dust-rule full exit");
+    }
+
+    // ============================================================
+    // V3 PHASE 1: OWNER PAUSE/UNPAUSE
+    // ============================================================
+
+    function test_owner_can_pause_and_unpause() public {
+        // owner == address(this); pauser is a separate address (0x4)
+        phlimbo.pause();
+        assertTrue(phlimbo.paused(), "owner paused directly");
+
+        phlimbo.unpause();
+        assertFalse(phlimbo.paused(), "owner unpaused directly");
+    }
+
+    function test_external_pauser_still_works() public {
+        vm.prank(pauser);
+        phlimbo.pause();
+        assertTrue(phlimbo.paused());
+
+        vm.prank(pauser);
+        phlimbo.unpause();
+        assertFalse(phlimbo.paused());
+    }
+
+    function test_third_party_cannot_pause_or_unpause() public {
+        vm.prank(eve);
+        vm.expectRevert("Only pauser or owner can pause");
+        phlimbo.pause();
+
+        phlimbo.pause();
+
+        vm.prank(eve);
+        vm.expectRevert("Only pauser or owner can unpause");
+        phlimbo.unpause();
+    }
+
+    // ============================================================
+    // V3 PHASE 1: pauseWithdraw DEBT REALIGNMENT (V1/V2 brick fix)
+    // ============================================================
+
+    /// @notice Regression for the pre-existing V1/V2 defect: a PARTIAL pauseWithdraw
+    ///         leaves debts computed against the old, larger amount, so after
+    ///         unpausing `amount * acc - debt` underflows and the user's
+    ///         claim/stake/withdraw all revert. V3 must realign debts.
+    function test_pauseWithdraw_partial_no_longer_bricks_user() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        vm.prank(rewardDonor);
+        phlimbo.collectReward(100 ether);
+
+        vm.warp(block.timestamp + 1000);
+
+        // Claim sets alice's stableDebt to a non-zero value aligned with full amount
+        vm.prank(alice);
+        phlimbo.claim(alice);
+
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        // Partial emergency exit: amount halves, V2 would leave debts stale
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(STAKE_AMOUNT / 2);
+
+        vm.prank(pauser);
+        phlimbo.unpause();
+
+        // In V2 this reverts with arithmetic underflow. V3 must succeed.
+        vm.prank(alice);
+        phlimbo.claim(alice);
+
+        // And the rest of the surface keeps working too
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT / 2, alice);
+    }
+
+    function test_pauseWithdraw_realigns_all_debts_and_forfeits_pending() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        vm.prank(rewardDonor);
+        phlimbo.collectReward(100 ether);
+
+        vm.warp(block.timestamp + 1000);
+
+        // Accrue into the accumulators (bob's stake triggers _updatePool)
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT, bob);
+
+        assertGt(phlimbo.pendingStable(alice), 0, "alice has pending stable");
+
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(STAKE_AMOUNT / 2);
+
+        (uint256 amount, uint256 phUSDDebt, uint256 stableDebt, uint256 promoDebt) = phlimbo.userInfo(alice);
+        assertEq(amount, STAKE_AMOUNT / 2);
+        assertEq(phUSDDebt, (amount * phlimbo.accPhUSDPerShare()) / 1e18, "phUSDDebt realigned");
+        assertEq(stableDebt, (amount * phlimbo.accStablePerShare()) / 1e18, "stableDebt realigned");
+        assertEq(promoDebt, (amount * phlimbo.accPromoPerShare()) / 1e18, "promoDebt realigned");
+
+        // Unclaimed accruals are forfeited: pending is now zero
+        assertEq(phlimbo.pendingStable(alice), 0, "pending stable forfeited");
+        assertEq(phlimbo.pendingPhUSD(alice), 0, "pending phUSD forfeited");
+    }
+
+    function test_pauseWithdraw_full_exit_does_not_touch_staker_set() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        assertEq(phlimbo.stakerCount(), 1);
+
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        // Full emergency exit while paused: set membership must NOT change
+        // (membership only mutates in whenNotPaused ops — frozen-set invariant)
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(STAKE_AMOUNT);
+
+        (uint256 amount,,,) = phlimbo.userInfo(alice);
+        assertEq(amount, 0);
+        assertEq(phlimbo.stakerCount(), 1, "alice still enumerated while paused");
+        assertEq(phlimbo.stakerAt(0), alice);
     }
 }

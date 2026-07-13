@@ -8,12 +8,23 @@ import "./IPhlimboHook.sol";
 /**
  * @title IPhlimboV3
  * @notice Interface for the PhlimboV3 staking yield farm contract.
- * @dev Mirrors `IPhlimbo` with the V2 differences:
- *      - `stake`, `withdraw`, `claim` accept an explicit `user` address.
- *      - Migrator role can act on behalf of any user.
- *      - Hook system: external `IPhlimboHook` callbacks after stake/withdraw/claim.
+ * @dev Mirrors `IPhlimboV2` plus the V3 promotional reward token subsystem:
+ *      - Single promo slot: owner-funded fixed quantity streamed linearly over its
+ *        own depletion window; dormant on depletion; reactivated by top-up.
+ *      - Rotation state machine: None → Active (startPromotion) → Flushing
+ *        (beginFlush) → None (finalizePromotion), with abortFlush: Flushing → Active.
+ *      - Staker enumeration (`stakerCount`/`stakerAt`) backing the flush.
+ *      - Owner may pause/unpause directly in addition to the external pauser.
  */
 interface IPhlimboV3 {
+    // ========================== TYPES ==========================
+
+    /// @notice Rotation state machine phase for the promotional slot
+    enum PromoPhase {
+        None,
+        Active,
+        Flushing
+    }
     // ========================== EVENTS ==========================
 
     /**
@@ -187,5 +198,29 @@ interface IPhlimboV3 {
     function hook() external view returns (IPhlimboHook);
     function PRECISION() external view returns (uint256);
     function SECONDS_PER_YEAR() external view returns (uint256);
-    function userInfo(address user) external view returns (uint256 amount, uint256 phUSDDebt, uint256 stableDebt);
+    function userInfo(address user)
+        external
+        view
+        returns (uint256 amount, uint256 phUSDDebt, uint256 stableDebt, uint256 promoDebt);
+    function promoToken() external view returns (IERC20);
+    function promoRewardBalance() external view returns (uint256);
+    function promoDepletionDuration() external view returns (uint256);
+    function promoRewardPerSecond() external view returns (uint256);
+    function accPromoPerShare() external view returns (uint256);
+    function promoPhase() external view returns (PromoPhase);
+    function flushCursor() external view returns (uint256);
+    function unclaimablePromo() external view returns (uint256);
+
+    // ========================== STAKER ENUMERATION ==========================
+
+    /**
+     * @notice Number of addresses currently in the staker set
+     */
+    function stakerCount() external view returns (uint256);
+
+    /**
+     * @notice Staker address at `index` in the staker set
+     * @param index Index into the enumerable staker set
+     */
+    function stakerAt(uint256 index) external view returns (address);
 }
