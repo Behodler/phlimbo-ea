@@ -1,0 +1,593 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./IFlax.sol";
+import "./interfaces/IPhlimboV3.sol";
+import "./interfaces/IPhlimboHook.sol";
+import {IPausable} from "lib/mutable/pauser/src/interfaces/IPausable.sol";
+
+/**
+ * @title PhlimboV3
+ * @notice Staking yield farm for phUSD tokens with Linear Depletion reward distribution.
+ *         V2 of PhlimboEA — same shape, three deliberate differences:
+ *
+ *         1. Fixed linear-depletion bug: `rewardPerSecond` is NOT recomputed inside
+ *            `_updatePool()`. It is recomputed only in `collectReward()` and
+ *            `setDepletionDuration()` so the depletion window does not reset on every
+ *            user interaction.
+ *         2. Migrator role: `stake`, `withdraw`, `claim` accept an explicit `user`
+ *            address. Auth is `msg.sender == user || msg.sender == migrator`.
+ *         3. Hook system: optional `IPhlimboHook` is invoked after stake/withdraw/claim.
+ *            The contract uses an explicit zero-address guard rather than wiring a
+ *            no-op default hook (saves ~2k gas when no hook is configured).
+ *
+ *         V1 (`PhlimboEA`) remains deployed; V2 coexists for migration. `pauseWithdraw`
+ *         is unchanged from V1 — strictly msg.sender-only, not delegatable to migrator.
+ */
+contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable {
+    using SafeERC20 for IERC20;
+
+    // ========================== STATE VARIABLES ==========================
+
+    /// @notice phUSD token - used for staking and rewards
+    IFlax public phUSD;
+
+    /// @notice External stablecoin token distributed as rewards (received from yield-accumulator)
+    IERC20 public rewardToken;
+
+    /// @notice Address authorized to pause the contract
+    address public override pauser;
+
+    /// @notice Desired APY in basis points (e.g., 500 = 5%)
+    uint256 public desiredAPYBps;
+
+    /// @notice Current phUSD emission rate per second
+    uint256 public phUSDPerSecond;
+
+    // Two-step APY setting state
+    /// @notice Proposed APY value awaiting confirmation
+    uint256 public pendingAPYBps;
+
+    /// @notice Block when APY was proposed
+    uint256 public pendingAPYBlockNumber;
+
+    /// @notice Whether a set operation is pending confirmation
+    bool public apySetInProgress;
+
+    /// @notice Total undistributed reward tokens (not yet accrued to stakers)
+    uint256 public rewardBalance;
+
+    /// @notice Target time window to fully distribute rewards (e.g., 604800 = 1 week)
+    uint256 public depletionDuration;
+
+    /// @notice Current reward rate per second (scaled by PRECISION)
+    uint256 public rewardPerSecond;
+
+    /// @notice Timestamp of last reward update
+    uint256 public lastRewardTime;
+
+    /// @notice Accumulated phUSD rewards per share (scaled by PRECISION)
+    uint256 public accPhUSDPerShare;
+
+    /// @notice Accumulated stable rewards per share (scaled by PRECISION)
+    uint256 public accStablePerShare;
+
+    /// @notice Total amount of phUSD staked in the contract
+    uint256 public totalStaked;
+
+    /// @notice Address allowed to act on behalf of any user via stake/withdraw/claim.
+    /// @dev Initialized to address(0) — role disabled until owner calls `setMigrator`.
+    address public migrator;
+
+    /// @notice Optional hook contract invoked after stake/withdraw/claim.
+    /// @dev Initialized to address(0) — no hook. Guarded with `if (address(hook) != address(0))`.
+    IPhlimboHook public hook;
+
+    // ========================== CONSTANTS ==========================
+
+    /// @notice Precision multiplier for reward calculations
+    uint256 public constant PRECISION = 1e18;
+
+    /// @notice Seconds in a year for APY calculations
+    uint256 public constant SECONDS_PER_YEAR = 365 days;
+
+    /// @notice Minimum stake amount to prevent first depositor attack (0.001 phUSD)
+    uint256 public constant MINIMUM_STAKE = 1e15;
+
+    // ========================== STRUCTS ==========================
+
+    /**
+     * @notice Tracks user staking information
+     */
+    struct UserInfo {
+        uint256 amount;
+        uint256 phUSDDebt;
+        uint256 stableDebt;
+    }
+
+    // ========================== MAPPINGS ==========================
+
+    /// @notice Mapping of user address to their staking information
+    mapping(address => UserInfo) public userInfo;
+
+    // ========================== EVENTS ==========================
+    // Note: Staked/Withdrawn/RewardsClaimed/EmergencyWithdrawal/MigratorSet/HookSet
+    // are declared in IPhlimboV3.
+
+    /// @notice Emitted when rewards are collected from yield-accumulator
+    event RewardCollected(uint256 amount, uint256 newRewardBalance, uint256 newRate);
+
+    /// @notice Emitted when reward rate is updated
+    event RateUpdated(uint256 newRate, uint256 newBalance);
+
+    /// @notice Emitted when depletion duration is updated
+    event DepletionDurationUpdated(uint256 oldDuration, uint256 newDuration);
+
+    /// @notice Emitted when an APY change is proposed (preview step)
+    event IntendedSetAPY(uint256 indexed proposedAPY, uint256 blockNumber, address indexed proposer);
+
+    /// @notice Emitted when an APY change is confirmed (commit step)
+    event DesiredAPYUpdated(uint256 oldAPY, uint256 newAPY);
+
+    // ========================== CONSTRUCTOR ==========================
+
+    /**
+     * @notice Initializes the PhlimboV3 staking contract
+     * @param _phUSD Address of the phUSD token
+     * @param _rewardToken Address of the stable token for rewards
+     * @param _depletionDuration Target time window to distribute rewards
+     */
+    constructor(
+        address _phUSD,
+        address _rewardToken,
+        uint256 _depletionDuration
+    ) Ownable(msg.sender) {
+        require(_phUSD != address(0), "Invalid phUSD address");
+        require(_rewardToken != address(0), "Invalid reward token address");
+        require(_depletionDuration > 0, "Duration must be > 0");
+
+        phUSD = IFlax(_phUSD);
+        rewardToken = IERC20(_rewardToken);
+        depletionDuration = _depletionDuration;
+        lastRewardTime = block.timestamp;
+        rewardBalance = 0;
+        rewardPerSecond = 0;
+
+        // Per "Hook gas pattern" decision in story Concerns: hook starts at address(0)
+        // and is checked with `if (address(hook) != address(0))` at each call site.
+        // No default hook contract is instantiated.
+        // migrator and hook are already zero-initialized — explicit comment for clarity.
+    }
+
+    // ========================== ADMIN FUNCTIONS ==========================
+
+    /**
+     * @notice Two-step APY setting: preview then commit
+     */
+    function setDesiredAPY(uint256 bps) external onlyOwner {
+        bool isPreview = !apySetInProgress ||
+                        block.number > pendingAPYBlockNumber + 100 ||
+                        bps != pendingAPYBps;
+
+        if (isPreview) {
+            emit IntendedSetAPY(bps, block.number, msg.sender);
+            pendingAPYBps = bps;
+            pendingAPYBlockNumber = block.number;
+            apySetInProgress = true;
+        } else {
+            _updatePool();
+            uint256 oldAPY = desiredAPYBps;
+            desiredAPYBps = bps;
+            _updatePhUSDEmissionRate();
+            emit DesiredAPYUpdated(oldAPY, bps);
+            apySetInProgress = false;
+        }
+    }
+
+    /**
+     * @notice Sets the depletion duration for reward distribution
+     * @dev Recomputes rate after window change — kept from V1 per planning Concerns.
+     */
+    function setDepletionDuration(uint256 _duration) external onlyOwner {
+        require(_duration > 0, "Duration must be > 0");
+
+        // Accrue pending rewards with old rate before changing duration
+        _updatePool();
+
+        uint256 oldDuration = depletionDuration;
+        depletionDuration = _duration;
+
+        // Recalculate rate with new duration. This recompute stays in V2 because the
+        // window has explicitly changed; the bug fix only removes the recompute from
+        // _updatePool() (which fires on every user interaction).
+        rewardPerSecond = (rewardBalance * PRECISION) / depletionDuration;
+
+        emit DepletionDurationUpdated(oldDuration, _duration);
+    }
+
+    /**
+     * @notice Unpauses the contract
+     */
+    function unpause() public override {
+        require(msg.sender == pauser, "Only pauser can unpause");
+        _unpause();
+    }
+
+    /**
+     * @notice Sets the address authorized to pause the contract
+     */
+    function setPauser(address _pauser) external onlyOwner {
+        pauser = _pauser;
+    }
+
+    /**
+     * @notice Sets the migrator address authorized to act on behalf of any user.
+     * @dev Accepts address(0) to disable the migrator role.
+     */
+    function setMigrator(address _migrator) external onlyOwner {
+        address oldMigrator = migrator;
+        migrator = _migrator;
+        emit MigratorSet(oldMigrator, _migrator);
+    }
+
+    /**
+     * @notice Sets the hook contract invoked after stake/withdraw/claim.
+     * @dev Accepts address(0) to disable the hook.
+     */
+    function setHook(address _hook) external onlyOwner {
+        address oldHook = address(hook);
+        hook = IPhlimboHook(_hook);
+        emit HookSet(oldHook, _hook);
+    }
+
+    /**
+     * @notice Emergency function to transfer all tokens to a recipient
+     */
+    function emergencyTransfer(address recipient) external onlyOwner {
+        uint256 phUSDBalance = phUSD.balanceOf(address(this));
+        uint256 rewardTokenBalance = rewardToken.balanceOf(address(this));
+
+        if (phUSDBalance > 0) {
+            IERC20(address(phUSD)).safeTransfer(recipient, phUSDBalance);
+        }
+        if (rewardTokenBalance > 0) {
+            rewardToken.safeTransfer(recipient, rewardTokenBalance);
+        }
+
+        _pause();
+    }
+
+    // ========================== PAUSE MECHANISM ==========================
+
+    /**
+     * @notice Pauses the contract
+     */
+    function pause() public override {
+        require(msg.sender == pauser, "Only pauser can pause");
+        _pause();
+    }
+
+    /**
+     * @notice Allows users to withdraw their staked phUSD when contract is paused
+     * @dev Emergency exit mechanism — strictly msg.sender-only. NOT delegatable to
+     *      migrator. Does NOT claim rewards or update pool. Does NOT invoke any hook.
+     */
+    function pauseWithdraw(uint256 amount) external whenPaused {
+        UserInfo storage user = userInfo[msg.sender];
+        require(user.amount >= amount, "Insufficient balance");
+        require(amount > 0, "Amount must be greater than 0");
+
+        user.amount -= amount;
+        totalStaked -= amount;
+
+        IERC20(address(phUSD)).safeTransfer(msg.sender, amount);
+
+        emit EmergencyWithdrawal(msg.sender, amount);
+    }
+
+    // ========================== REWARD COLLECTION ==========================
+
+    /**
+     * @notice Collects rewards and updates linear depletion rate
+     */
+    function collectReward(uint256 amount) external nonReentrant {
+        require(amount > 0, "Amount must be greater than 0");
+
+        // Update pool FIRST to accrue pending rewards before adding new balance
+        _updatePool();
+
+        rewardToken.safeTransferFrom(msg.sender, address(this), amount);
+
+        rewardBalance += amount;
+
+        // Recalculate rate based on new balance — this is the canonical recompute site.
+        rewardPerSecond = (rewardBalance * PRECISION) / depletionDuration;
+
+        emit RewardCollected(amount, rewardBalance, rewardPerSecond);
+    }
+
+    // ========================== CORE STAKING FUNCTIONS ==========================
+
+    /**
+     * @notice Stake phUSD tokens on behalf of `user`
+     * @dev Auth: msg.sender == user || msg.sender == migrator. Tokens are pulled from
+     *      msg.sender via safeTransferFrom. The position is credited to `user`.
+     *      Any auto-claimed rewards go to msg.sender (not `user`) — consistent with
+     *      withdraw/claim routing during migrator delegation.
+     */
+    function stake(uint256 amount, address user) external whenNotPaused nonReentrant {
+        require(amount >= MINIMUM_STAKE, "Below minimum stake");
+        require(user != address(0), "Invalid user");
+        require(msg.sender == user || msg.sender == migrator, "Not authorized");
+
+        _updatePool();
+
+        UserInfo storage userDetails = userInfo[user];
+
+        // Claim any pending rewards first. Route auto-claim to msg.sender so the
+        // migrator path is consistent: rewards always go to the caller during
+        // delegation. Self-service paths (msg.sender == user) end up routing to the
+        // user themselves, which matches V1.
+        if (userDetails.amount > 0) {
+            _claimRewards(user, msg.sender);
+        }
+
+        // Transfer phUSD from msg.sender (caller always pays)
+        IERC20(address(phUSD)).safeTransferFrom(msg.sender, address(this), amount);
+
+        userDetails.amount += amount;
+        userDetails.phUSDDebt = (userDetails.amount * accPhUSDPerShare) / PRECISION;
+        userDetails.stableDebt = (userDetails.amount * accStablePerShare) / PRECISION;
+
+        totalStaked += amount;
+
+        _updatePhUSDEmissionRate();
+
+        emit Staked(user, amount);
+
+        if (address(hook) != address(0)) {
+            hook.onDeposit(msg.sender, user, amount);
+        }
+    }
+
+    /**
+     * @notice Withdraw staked phUSD and auto-claim rewards on behalf of `user`
+     * @dev Auth: msg.sender == user || msg.sender == migrator. Withdrawn tokens AND
+     *      any auto-claimed rewards are sent to msg.sender.
+     */
+    function withdraw(uint256 amount, address user) external whenNotPaused nonReentrant {
+        require(user != address(0), "Invalid user");
+        require(msg.sender == user || msg.sender == migrator, "Not authorized");
+
+        UserInfo storage userDetails = userInfo[user];
+        require(userDetails.amount >= amount, "Insufficient balance");
+
+        _updatePool();
+
+        // Route auto-claim to msg.sender (caller) — consistent with stake/claim.
+        _claimRewards(user, msg.sender);
+
+        uint256 remaining = userDetails.amount - amount;
+
+        // Prevent dust: if remaining would be > 0 but < MINIMUM_STAKE, force full withdrawal
+        uint256 actualWithdrawAmount = amount;
+        if (remaining > 0 && remaining < MINIMUM_STAKE) {
+            actualWithdrawAmount = userDetails.amount;
+            remaining = 0;
+        }
+
+        userDetails.amount = remaining;
+        userDetails.phUSDDebt = (userDetails.amount * accPhUSDPerShare) / PRECISION;
+        userDetails.stableDebt = (userDetails.amount * accStablePerShare) / PRECISION;
+
+        totalStaked -= actualWithdrawAmount;
+
+        // Transfer phUSD to msg.sender (caller). When the migrator calls on behalf
+        // of a user, the migrator wallet receives the tokens.
+        IERC20(address(phUSD)).safeTransfer(msg.sender, actualWithdrawAmount);
+
+        _updatePhUSDEmissionRate();
+
+        emit Withdrawn(user, actualWithdrawAmount);
+
+        if (address(hook) != address(0)) {
+            hook.onWithdraw(msg.sender, user, actualWithdrawAmount);
+        }
+    }
+
+    /**
+     * @notice Claim pending rewards on behalf of `user` without withdrawing stake
+     * @dev Auth: msg.sender == user || msg.sender == migrator. Rewards go to msg.sender.
+     */
+    function claim(address user) external whenNotPaused nonReentrant {
+        require(user != address(0), "Invalid user");
+        require(msg.sender == user || msg.sender == migrator, "Not authorized");
+
+        _updatePool();
+
+        // Snapshot claimable amounts BEFORE _claimRewards updates user.debt internally,
+        // so we can pass exact amounts to the hook.
+        UserInfo storage userDetails = userInfo[user];
+        uint256 pendingPhUSDAmount;
+        uint256 pendingRewardAmount;
+        if (userDetails.amount > 0) {
+            pendingPhUSDAmount = (userDetails.amount * accPhUSDPerShare) / PRECISION - userDetails.phUSDDebt;
+            pendingRewardAmount = (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;
+        }
+
+        // Route rewards to msg.sender (caller).
+        _claimRewards(user, msg.sender);
+
+        userDetails.phUSDDebt = (userDetails.amount * accPhUSDPerShare) / PRECISION;
+        userDetails.stableDebt = (userDetails.amount * accStablePerShare) / PRECISION;
+
+        if (address(hook) != address(0)) {
+            hook.onClaim(msg.sender, user, pendingPhUSDAmount, pendingRewardAmount);
+        }
+    }
+
+    // ========================== INTERNAL FUNCTIONS ==========================
+
+    /**
+     * @notice Updates pool accumulators based on linear depletion reward rate
+     * @dev V2 FIX: does NOT recompute rewardPerSecond here. The recompute lives in
+     *      collectReward() and setDepletionDuration() only, so the depletion window
+     *      does not silently reset on every user interaction.
+     */
+    function _updatePool() internal {
+        if (block.timestamp <= lastRewardTime) {
+            return;
+        }
+
+        if (totalStaked == 0) {
+            lastRewardTime = block.timestamp;
+            return;
+        }
+
+        uint256 timeElapsed = block.timestamp - lastRewardTime;
+
+        uint256 potentialReward = (rewardPerSecond * timeElapsed) / PRECISION;
+
+        // Cap distribution by rewardBalance to prevent over-distribution
+        uint256 toDistribute = potentialReward > rewardBalance ? rewardBalance : potentialReward;
+
+        if (toDistribute > 0) {
+            accStablePerShare += (toDistribute * PRECISION) / totalStaked;
+
+            // Decrease rewardBalance by distributed amount
+            rewardBalance -= toDistribute;
+
+            // NOTE: V1 used to recompute `rewardPerSecond` here. V2 deliberately does
+            // not — that was the bug. Rate is recomputed only in collectReward() and
+            // setDepletionDuration().
+        }
+
+        // Update phUSD rewards (if phUSDPerSecond is set)
+        if (phUSDPerSecond > 0) {
+            uint256 phUSDReward = timeElapsed * phUSDPerSecond;
+            accPhUSDPerShare += (phUSDReward * PRECISION) / totalStaked;
+        }
+
+        lastRewardTime = block.timestamp;
+    }
+
+    /**
+     * @notice Claims pending rewards for `user`, sending them to `beneficiary`.
+     * @dev V1 always sent rewards to `user`. In V2 the beneficiary is the caller
+     *      (msg.sender) so migrator-delegated calls land rewards in the migrator
+     *      wallet. For self-service (caller == user) beneficiary collapses to the
+     *      user themselves and behavior matches V1.
+     */
+    function _claimRewards(address user, address beneficiary) internal {
+        UserInfo storage userDetails = userInfo[user];
+
+        if (userDetails.amount == 0) {
+            return;
+        }
+
+        uint256 pendingPhUSDAmount = (userDetails.amount * accPhUSDPerShare) / PRECISION - userDetails.phUSDDebt;
+        if (pendingPhUSDAmount > 0) {
+            phUSD.mint(beneficiary, pendingPhUSDAmount);
+        }
+
+        uint256 pendingRewardAmount = (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;
+        if (pendingRewardAmount > 0) {
+            rewardToken.safeTransfer(beneficiary, pendingRewardAmount);
+        }
+
+        if (pendingPhUSDAmount > 0 || pendingRewardAmount > 0) {
+            // Indexed by `user` (whose accrued rewards were drained), matching V1 semantics.
+            emit RewardsClaimed(user, pendingPhUSDAmount, pendingRewardAmount);
+        }
+    }
+
+    /**
+     * @notice Updates phUSD emission rate based on total staked and desired APY
+     */
+    function _updatePhUSDEmissionRate() internal {
+        if (totalStaked == 0) {
+            phUSDPerSecond = 0;
+            return;
+        }
+
+        phUSDPerSecond = (totalStaked * desiredAPYBps) / 10000 / SECONDS_PER_YEAR;
+    }
+
+    // ========================== VIEW FUNCTIONS ==========================
+
+    /**
+     * @notice Returns pending phUSD rewards for a user
+     */
+    function pendingPhUSD(address user) external view returns (uint256) {
+        UserInfo storage userDetails = userInfo[user];
+        uint256 _accPhUSDPerShare = accPhUSDPerShare;
+
+        if (block.timestamp > lastRewardTime && totalStaked != 0) {
+            uint256 timeElapsed = block.timestamp - lastRewardTime;
+            uint256 phUSDReward = timeElapsed * phUSDPerSecond;
+            _accPhUSDPerShare += (phUSDReward * PRECISION) / totalStaked;
+        }
+
+        return (userDetails.amount * _accPhUSDPerShare) / PRECISION - userDetails.phUSDDebt;
+    }
+
+    /**
+     * @notice Returns pending stable rewards for a user
+     */
+    function pendingStable(address user) external view returns (uint256) {
+        UserInfo storage userDetails = userInfo[user];
+        uint256 _accStablePerShare = accStablePerShare;
+
+        if (block.timestamp > lastRewardTime && totalStaked != 0) {
+            uint256 timeElapsed = block.timestamp - lastRewardTime;
+            uint256 potentialReward = (rewardPerSecond * timeElapsed) / PRECISION;
+
+            uint256 toDistribute = potentialReward > rewardBalance ? rewardBalance : potentialReward;
+
+            if (toDistribute > 0) {
+                _accStablePerShare += (toDistribute * PRECISION) / totalStaked;
+            }
+        }
+
+        return (userDetails.amount * _accStablePerShare) / PRECISION - userDetails.stableDebt;
+    }
+
+    /**
+     * @notice Returns current pool information
+     */
+    function getPoolInfo() external view returns (
+        uint256 _totalStaked,
+        uint256 _accPhUSDPerShare,
+        uint256 _accStablePerShare,
+        uint256 _phUSDPerSecond,
+        uint256 _lastRewardTime
+    ) {
+        return (
+            totalStaked,
+            accPhUSDPerShare,
+            accStablePerShare,
+            phUSDPerSecond,
+            lastRewardTime
+        );
+    }
+
+    /**
+     * @notice Returns information about pending APY setting operation
+     */
+    function getPendingAPYInfo() external view returns (
+        uint256 _pendingAPYBps,
+        uint256 _pendingAPYBlockNumber,
+        bool _apySetInProgress
+    ) {
+        return (
+            pendingAPYBps,
+            pendingAPYBlockNumber,
+            apySetInProgress
+        );
+    }
+}
