@@ -32,7 +32,10 @@ import {IPausable} from "lib/mutable/pauser/src/interfaces/IPausable.sol";
  *            (b) The flush is provably complete over a frozen staker set — set
  *                membership only mutates in `whenNotPaused` ops, and a monotone
  *                `flushCursor` makes coverage contiguous; `finalizePromotion`
- *                requires `flushCursor == _stakers.length()`.
+ *                requires `flushCursor == _stakers.length()`. `accPromoPerShare`
+ *                itself is frozen during `Flushing` by `_updatePool`'s phase gate
+ *                (NOT by the pause — `collectReward` and the owner setters are
+ *                not `whenNotPaused`), so aligned debts stay aligned.
  *         3. Pause deltas from V2: owner may pause/unpause directly (external pauser
  *            still supported); `unpause()` reverts while flushing; `pauseWithdraw`
  *            realigns ALL reward debts to the reduced amount (fixes the latent V1/V2
@@ -118,7 +121,9 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     /// @notice Accumulated promo rewards per share (scaled by PRECISION).
     /// @dev NEVER reset across promotions — the flush aligns every staker's
     ///      `promoDebt` to this accumulator instead. Zeroing it while debts are
-    ///      non-zero would underflow `amount * acc - debt`.
+    ///      non-zero would underflow `amount * acc - debt`. Frozen while
+    ///      `promoPhase == Flushing` (via `_updatePool`'s phase gate), keeping
+    ///      `batchClaim`'s debt alignment valid for the whole flush window.
     uint256 public accPromoPerShare;
 
     /// @notice Enumerable set of every address with a non-zero staked amount.
@@ -192,11 +197,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
      * @param _rewardToken Address of the stable token for rewards
      * @param _depletionDuration Target time window to distribute rewards
      */
-    constructor(
-        address _phUSD,
-        address _rewardToken,
-        uint256 _depletionDuration
-    ) Ownable(msg.sender) {
+    constructor(address _phUSD, address _rewardToken, uint256 _depletionDuration) Ownable(msg.sender) {
         require(_phUSD != address(0), "Invalid phUSD address");
         require(_rewardToken != address(0), "Invalid reward token address");
         require(_depletionDuration > 0, "Duration must be > 0");
@@ -220,9 +221,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
      * @notice Two-step APY setting: preview then commit
      */
     function setDesiredAPY(uint256 bps) external onlyOwner {
-        bool isPreview = !apySetInProgress ||
-                        block.number > pendingAPYBlockNumber + 100 ||
-                        bps != pendingAPYBps;
+        bool isPreview = !apySetInProgress || block.number > pendingAPYBlockNumber + 100 || bps != pendingAPYBps;
 
         if (isPreview) {
             emit IntendedSetAPY(bps, block.number, msg.sender);
@@ -335,10 +334,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
      */
     function startPromotion(address token, uint256 amount, uint256 duration) external onlyOwner whenNotPaused {
         require(promoPhase == PromoPhase.None, "Promo phase must be None");
-        require(
-            token != address(0) && token != address(phUSD) && token != address(rewardToken),
-            "Invalid promo token"
-        );
+        require(token != address(0) && token != address(phUSD) && token != address(rewardToken), "Invalid promo token");
         require(amount > 0, "Amount must be greater than 0");
         require(duration > 0, "Duration must be > 0");
 
@@ -348,10 +344,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
         uint256 balanceBefore = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        require(
-            IERC20(token).balanceOf(address(this)) - balanceBefore == amount,
-            "Fee-on-transfer not supported"
-        );
+        require(IERC20(token).balanceOf(address(this)) - balanceBefore == amount, "Fee-on-transfer not supported");
 
         promoToken = IERC20(token);
         promoRewardBalance = amount;
@@ -376,10 +369,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
         uint256 balanceBefore = promoToken.balanceOf(address(this));
         promoToken.safeTransferFrom(msg.sender, address(this), amount);
-        require(
-            promoToken.balanceOf(address(this)) - balanceBefore == amount,
-            "Fee-on-transfer not supported"
-        );
+        require(promoToken.balanceOf(address(this)) - balanceBefore == amount, "Fee-on-transfer not supported");
 
         promoRewardBalance += amount;
         promoRewardPerSecond = (promoRewardBalance * PRECISION) / promoDepletionDuration;
@@ -410,10 +400,12 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     /**
      * @notice Begins the rotation flush: final promo accrual up to now, then pause.
      *         Phase Active → Flushing.
-     * @dev Pausing blocks all whenNotPaused ops, so from this point accPromoPerShare,
-     *      every user's amount (except pauseWithdraw, which realigns debts), and the
-     *      staker set are frozen. `_pause()` reverts if already paused — a flush
-     *      cannot be started over an unrelated pause.
+     * @dev Pausing blocks all whenNotPaused ops, so from this point every user's
+     *      amount (except pauseWithdraw, which realigns debts) and the
+     *      staker set are frozen. accPromoPerShare is frozen NOT by the pause but
+     *      by _updatePool's Flushing phase gate — collectReward and the owner
+     *      setters reach _updatePool while paused. `_pause()` reverts if already
+     *      paused — a flush cannot be started over an unrelated pause.
      */
     function beginFlush() external onlyOwner {
         require(promoPhase == PromoPhase.Active, "Promo phase must be Active");
@@ -750,10 +742,21 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         // the stable block on separate variables. Skipped when no promotion is set.
         // Rate is NEVER recomputed here (recompute lives only in topUpPromotion and
         // setPromoDepletionDuration — the V2 bug-fix discipline).
-        if (address(promoToken) != address(0)) {
+        //
+        // Phase gate (audit-07 H-01): the accumulator freeze during Flushing is an
+        // ACCRUAL property, not a pause property, so it is enforced here at the
+        // accrual site rather than with `whenNotPaused` on the callers. Three paths
+        // reach _updatePool while paused — permissionless collectReward, plus the
+        // owner setters setDesiredAPY (commit branch) and setDepletionDuration —
+        // and any of them would otherwise advance accPromoPerShare after batchClaim
+        // has aligned every promoDebt, minting phantom pending that survives
+        // finalizePromotion and is claimable against the NEXT promo's token (§2.1).
+        // Gating here closes all three paths at once and is future-proof against
+        // new call sites. beginFlush's own final accrual is unaffected: it calls
+        // _updatePool while promoPhase is still Active.
+        if (address(promoToken) != address(0) && promoPhase != PromoPhase.Flushing) {
             uint256 potentialPromo = (promoRewardPerSecond * timeElapsed) / PRECISION;
-            uint256 promoToDistribute =
-                potentialPromo > promoRewardBalance ? promoRewardBalance : potentialPromo;
+            uint256 promoToDistribute = potentialPromo > promoRewardBalance ? promoRewardBalance : potentialPromo;
 
             if (promoToDistribute > 0) {
                 accPromoPerShare += (promoToDistribute * PRECISION) / totalStaked;
@@ -798,8 +801,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         // so pending is zero by construction and only the callers' debt realignment
         // runs. Same beneficiary routing as phUSD/stable (caller during delegation).
         if (address(promoToken) != address(0)) {
-            uint256 pendingPromoAmount =
-                (userDetails.amount * accPromoPerShare) / PRECISION - userDetails.promoDebt;
+            uint256 pendingPromoAmount = (userDetails.amount * accPromoPerShare) / PRECISION - userDetails.promoDebt;
             if (pendingPromoAmount > 0) {
                 promoToken.safeTransfer(beneficiary, pendingPromoAmount);
                 emit PromoClaimed(user, pendingPromoAmount);
@@ -814,8 +816,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
      *         either nothing or true).
      */
     function _tryTransfer(IERC20 token, address to, uint256 amount) internal returns (bool success) {
-        (bool callSuccess, bytes memory returndata) =
-            address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        (bool callSuccess, bytes memory returndata) = address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
         return callSuccess && (returndata.length == 0 || abi.decode(returndata, (bool)));
     }
 
@@ -877,12 +878,16 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         UserInfo storage userDetails = userInfo[user];
         uint256 _accPromoPerShare = accPromoPerShare;
 
-        if (address(promoToken) != address(0) && block.timestamp > lastRewardTime && totalStaked != 0) {
+        // Mirrors _updatePool's phase gate (audit-07 H-01): during Flushing the
+        // accumulator is frozen, so the view must not project accrual either.
+        if (
+            address(promoToken) != address(0) && promoPhase != PromoPhase.Flushing && block.timestamp > lastRewardTime
+                && totalStaked != 0
+        ) {
             uint256 timeElapsed = block.timestamp - lastRewardTime;
             uint256 potentialPromo = (promoRewardPerSecond * timeElapsed) / PRECISION;
 
-            uint256 promoToDistribute =
-                potentialPromo > promoRewardBalance ? promoRewardBalance : potentialPromo;
+            uint256 promoToDistribute = potentialPromo > promoRewardBalance ? promoRewardBalance : potentialPromo;
 
             if (promoToDistribute > 0) {
                 _accPromoPerShare += (promoToDistribute * PRECISION) / totalStaked;
@@ -895,14 +900,18 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     /**
      * @notice Returns current promotional slot information
      */
-    function getPromoInfo() external view returns (
-        address _promoToken,
-        uint256 _promoRewardBalance,
-        uint256 _promoRewardPerSecond,
-        uint256 _promoDepletionDuration,
-        PromoPhase _promoPhase,
-        uint256 _flushCursor
-    ) {
+    function getPromoInfo()
+        external
+        view
+        returns (
+            address _promoToken,
+            uint256 _promoRewardBalance,
+            uint256 _promoRewardPerSecond,
+            uint256 _promoDepletionDuration,
+            PromoPhase _promoPhase,
+            uint256 _flushCursor
+        )
+    {
         return (
             address(promoToken),
             promoRewardBalance,
@@ -930,34 +939,28 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     /**
      * @notice Returns current pool information
      */
-    function getPoolInfo() external view returns (
-        uint256 _totalStaked,
-        uint256 _accPhUSDPerShare,
-        uint256 _accStablePerShare,
-        uint256 _phUSDPerSecond,
-        uint256 _lastRewardTime
-    ) {
-        return (
-            totalStaked,
-            accPhUSDPerShare,
-            accStablePerShare,
-            phUSDPerSecond,
-            lastRewardTime
-        );
+    function getPoolInfo()
+        external
+        view
+        returns (
+            uint256 _totalStaked,
+            uint256 _accPhUSDPerShare,
+            uint256 _accStablePerShare,
+            uint256 _phUSDPerSecond,
+            uint256 _lastRewardTime
+        )
+    {
+        return (totalStaked, accPhUSDPerShare, accStablePerShare, phUSDPerSecond, lastRewardTime);
     }
 
     /**
      * @notice Returns information about pending APY setting operation
      */
-    function getPendingAPYInfo() external view returns (
-        uint256 _pendingAPYBps,
-        uint256 _pendingAPYBlockNumber,
-        bool _apySetInProgress
-    ) {
-        return (
-            pendingAPYBps,
-            pendingAPYBlockNumber,
-            apySetInProgress
-        );
+    function getPendingAPYInfo()
+        external
+        view
+        returns (uint256 _pendingAPYBps, uint256 _pendingAPYBlockNumber, bool _apySetInProgress)
+    {
+        return (pendingAPYBps, pendingAPYBlockNumber, apySetInProgress);
     }
 }
