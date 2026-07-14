@@ -101,6 +101,29 @@ interface IPhlimboV3 {
      */
     event PromoClaimed(address indexed user, uint256 amount);
 
+    /**
+     * @notice Emitted after each batchClaim chunk
+     * @param cursor New flush cursor position
+     * @param total Total staker set size being flushed
+     */
+    event FlushProgress(uint256 cursor, uint256 total);
+
+    /**
+     * @notice Emitted when a promo transfer to a user fails during the flush and the
+     *         amount is banked into `unclaimablePromo` instead (flush continues)
+     * @param user Recipient whose transfer failed
+     * @param amount Amount banked
+     */
+    event PromoClaimFailed(address indexed user, uint256 amount);
+
+    /**
+     * @notice Emitted when a promotion is finalized and the slot cleared
+     * @param token The promo token that was retired
+     * @param leftoverRecipient Recipient of the leftover sweep
+     * @param leftoverAmount Amount swept (undistributed remainder + rounding dust + unclaimablePromo)
+     */
+    event PromotionFinalized(address indexed token, address indexed leftoverRecipient, uint256 leftoverAmount);
+
     // ========================== PROMO LIFECYCLE (OWNER) ==========================
 
     /**
@@ -123,6 +146,38 @@ interface IPhlimboV3 {
      *         Requires phase Active.
      */
     function setPromoDepletionDuration(uint256 duration) external;
+
+    // ========================== PROMO ROTATION (FLUSH) ==========================
+
+    /**
+     * @notice Begins the rotation flush: final promo accrual, pause, cursor reset.
+     *         Phase Active → Flushing. Owner only.
+     */
+    function beginFlush() external;
+
+    /**
+     * @notice Processes up to `maxIterations` stakers from the flush cursor: pays each
+     *         staker's pending promo TO THE STAKER DIRECTLY and aligns their promoDebt
+     *         to the current accumulator. Permissionless — recipients and amounts are
+     *         fixed by state. Requires phase Flushing. Failed transfers are banked
+     *         into `unclaimablePromo` (flush continues).
+     */
+    function batchClaim(uint256 maxIterations) external;
+
+    /**
+     * @notice Finalizes the rotation: requires the flush cursor to have covered the
+     *         entire staker set. Sweeps the remaining promo token balance (leftover +
+     *         rounding dust + unclaimablePromo) to `leftoverRecipient` and clears the
+     *         slot (promoToken/rate/balance zeroed; accPromoPerShare NEVER reset).
+     *         Phase Flushing → None. Owner only.
+     */
+    function finalizePromotion(address leftoverRecipient) external;
+
+    /**
+     * @notice Aborts an in-progress flush, returning to Active. Always safe: batchClaim
+     *         is just early forced claims with debts correctly aligned. Owner only.
+     */
+    function abortFlush() external;
 
     // ========================== PROMO VIEWS ==========================
 

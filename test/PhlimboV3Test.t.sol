@@ -32,6 +32,9 @@ contract PhlimboV3Test is Test {
     event PromotionToppedUp(uint256 amount, uint256 newBalance, uint256 newRate);
     event PromoDepletionDurationUpdated(uint256 oldDuration, uint256 newDuration);
     event PromoClaimed(address indexed user, uint256 amount);
+    event FlushProgress(uint256 cursor, uint256 total);
+    event PromoClaimFailed(address indexed user, uint256 amount);
+    event PromotionFinalized(address indexed token, address indexed leftoverRecipient, uint256 leftoverAmount);
 
     PhlimboV3 public phlimbo;
     MockFlax public phUSD;
@@ -1355,5 +1358,401 @@ contract PhlimboV3Test is Test {
         // V2 routing preserved: promo rewards go to the caller during delegation
         assertEq(partner.balanceOf(migrator), PROMO_AMOUNT / 2, "migrator receives promo");
         assertEq(partner.balanceOf(alice), 0, "alice receives nothing");
+    }
+
+    // ============================================================
+    // V3 PHASE 3: ROTATION STATE MACHINE — PHASE TRANSITIONS
+    // ============================================================
+
+    /// @dev alice (1x) and bob (3x) staked, promo Active, half the window elapsed.
+    ///      Pendings: alice = PROMO_AMOUNT/8, bob = 3*PROMO_AMOUNT/8.
+    function _setupActivePromoHalfStreamed() internal {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT * 3, bob);
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+    }
+
+    function test_beginFlush_requires_active_and_owner() public {
+        vm.expectRevert("Promo phase must be Active");
+        phlimbo.beginFlush();
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+
+        vm.prank(eve);
+        vm.expectRevert();
+        phlimbo.beginFlush();
+    }
+
+    function test_beginFlush_pauses_and_enters_flushing() public {
+        _setupActivePromoHalfStreamed();
+
+        phlimbo.beginFlush();
+
+        assertTrue(phlimbo.paused(), "beginFlush pauses");
+        assertEq(uint256(phlimbo.promoPhase()), uint256(IPhlimboV3.PromoPhase.Flushing));
+        assertEq(phlimbo.flushCursor(), 0);
+
+        // Final accrual happened: half of Q already moved out of promoRewardBalance
+        assertEq(phlimbo.promoRewardBalance(), PROMO_AMOUNT / 2, "beginFlush accrues first");
+
+        // Cannot begin again while Flushing
+        vm.expectRevert("Promo phase must be Active");
+        phlimbo.beginFlush();
+    }
+
+    function test_batchClaim_requires_flushing() public {
+        vm.expectRevert("Promo phase must be Flushing");
+        phlimbo.batchClaim(10);
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+
+        vm.expectRevert("Promo phase must be Flushing");
+        phlimbo.batchClaim(10);
+    }
+
+    function test_finalizePromotion_reverts_until_cursor_complete() public {
+        _setupActivePromoHalfStreamed();
+        phlimbo.beginFlush();
+
+        vm.expectRevert("Flush incomplete");
+        phlimbo.finalizePromotion(owner);
+
+        phlimbo.batchClaim(1);
+        assertEq(phlimbo.flushCursor(), 1);
+
+        vm.expectRevert("Flush incomplete");
+        phlimbo.finalizePromotion(owner);
+
+        phlimbo.batchClaim(1);
+        assertEq(phlimbo.flushCursor(), 2);
+
+        phlimbo.finalizePromotion(owner);
+        assertEq(uint256(phlimbo.promoPhase()), uint256(IPhlimboV3.PromoPhase.None));
+    }
+
+    function test_finalizePromotion_requires_flushing_and_owner() public {
+        vm.expectRevert("Promo phase must be Flushing");
+        phlimbo.finalizePromotion(owner);
+
+        _setupActivePromoHalfStreamed();
+
+        vm.expectRevert("Promo phase must be Flushing");
+        phlimbo.finalizePromotion(owner);
+
+        phlimbo.beginFlush();
+        phlimbo.batchClaim(10);
+
+        vm.prank(eve);
+        vm.expectRevert();
+        phlimbo.finalizePromotion(eve);
+    }
+
+    function test_abortFlush_returns_to_active() public {
+        vm.expectRevert("Promo phase must be Flushing");
+        phlimbo.abortFlush();
+
+        _setupActivePromoHalfStreamed();
+        phlimbo.beginFlush();
+
+        // Partial flush is fine: batchClaim is just early forced claims
+        phlimbo.batchClaim(1);
+
+        vm.prank(eve);
+        vm.expectRevert();
+        phlimbo.abortFlush();
+
+        phlimbo.abortFlush();
+        assertEq(uint256(phlimbo.promoPhase()), uint256(IPhlimboV3.PromoPhase.Active));
+
+        phlimbo.unpause();
+        assertFalse(phlimbo.paused());
+
+        // Stream still Active on the same token/rate; users can transact again
+        vm.warp(block.timestamp + PROMO_DURATION / 4);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+        assertGt(partner.balanceOf(alice), 0, "stream continues after abort");
+    }
+
+    function test_unpause_reverts_while_flushing() public {
+        _setupActivePromoHalfStreamed();
+        phlimbo.beginFlush();
+
+        vm.expectRevert("Cannot unpause while flushing");
+        phlimbo.unpause();
+
+        vm.prank(pauser);
+        vm.expectRevert("Cannot unpause while flushing");
+        phlimbo.unpause();
+
+        phlimbo.batchClaim(10);
+        phlimbo.finalizePromotion(owner);
+
+        phlimbo.unpause();
+        assertFalse(phlimbo.paused());
+    }
+
+    // ============================================================
+    // V3 PHASE 3: CURSOR CHUNKING
+    // ============================================================
+
+    function test_batchClaim_cursor_chunking_no_gaps_no_double_pays() public {
+        // Three stakers with equal stakes
+        phUSD.mint(eve, INITIAL_BALANCE);
+        vm.prank(eve);
+        phUSD.approve(address(phlimbo), type(uint256).max);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT, bob);
+        vm.prank(eve);
+        phlimbo.stake(STAKE_AMOUNT, eve);
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        uint256 share = phlimbo.pendingPromo(alice); // equal stakes → equal share
+        assertGt(share, 0);
+
+        phlimbo.beginFlush();
+        assertEq(phlimbo.stakerCount(), 3);
+
+        // Chunk 1 covers two stakers
+        vm.expectEmit(false, false, false, true);
+        emit FlushProgress(2, 3);
+        phlimbo.batchClaim(2);
+        assertEq(phlimbo.flushCursor(), 2);
+
+        // Chunk 2: maxIterations larger than remainder is clamped
+        phlimbo.batchClaim(10);
+        assertEq(phlimbo.flushCursor(), 3);
+
+        assertEq(partner.balanceOf(alice), share, "alice paid exactly once");
+        assertEq(partner.balanceOf(bob), share, "bob paid exactly once");
+        assertEq(partner.balanceOf(eve), share, "eve paid exactly once");
+
+        // Idempotent past the end: no double pays, cursor stays
+        phlimbo.batchClaim(10);
+        assertEq(phlimbo.flushCursor(), 3);
+        assertEq(partner.balanceOf(alice), share, "no double pay");
+    }
+
+    function test_batchClaim_permissionless_pays_staker_directly() public {
+        _setupActivePromoHalfStreamed();
+        uint256 alicePending = phlimbo.pendingPromo(alice);
+        uint256 bobPending = phlimbo.pendingPromo(bob);
+
+        phlimbo.beginFlush();
+
+        // eve — not owner, not a staker — completes the flush
+        vm.prank(eve);
+        phlimbo.batchClaim(10);
+
+        assertEq(partner.balanceOf(alice), alicePending, "staker alice paid directly");
+        assertEq(partner.balanceOf(bob), bobPending, "staker bob paid directly");
+        assertEq(partner.balanceOf(eve), 0, "caller receives nothing");
+        assertEq(phlimbo.pendingPromo(alice), 0, "debt aligned");
+        assertEq(phlimbo.pendingPromo(bob), 0, "debt aligned");
+    }
+
+    // ============================================================
+    // V3 PHASE 3: §2.1 CONTAMINATION REGRESSION
+    // ============================================================
+
+    function test_rotation_contamination_regression() public {
+        // alice holds unclaimed token-A pending across a full rotation
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        uint256 entitlementA = phlimbo.pendingPromo(alice);
+        assertEq(entitlementA, PROMO_AMOUNT / 2);
+
+        // Full rotation: flush pays alice her exact A entitlement
+        phlimbo.beginFlush();
+        phlimbo.batchClaim(10);
+        assertEq(partner.balanceOf(alice), entitlementA, "exact A entitlement in flush");
+
+        uint256 accAfterFlush = phlimbo.accPromoPerShare();
+        assertGt(accAfterFlush, 0);
+
+        address recipient = address(0x99);
+        phlimbo.finalizePromotion(recipient);
+
+        // Load-bearing invariant: the accumulator is NEVER reset
+        assertEq(phlimbo.accPromoPerShare(), accAfterFlush, "accPromoPerShare survives finalize");
+
+        phlimbo.unpause();
+
+        // Promotion B on a different token
+        MockStable tokenB = new MockStable();
+        uint256 amountB = 600 ether;
+        tokenB.mint(owner, amountB);
+        tokenB.approve(address(phlimbo), type(uint256).max);
+        phlimbo.startPromotion(address(tokenB), amountB, PROMO_DURATION);
+
+        // Immediately after start: alice's pending against B is exactly zero
+        assertEq(phlimbo.pendingPromo(alice), 0, "clean slate at start of B");
+
+        vm.warp(block.timestamp + PROMO_DURATION / 4);
+        assertEq(phlimbo.pendingPromo(alice), amountB / 4, "accrues only B");
+
+        uint256 partnerBefore = partner.balanceOf(alice);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+
+        assertEq(tokenB.balanceOf(alice), amountB / 4, "paid in B only");
+        assertEq(partner.balanceOf(alice), partnerBefore, "no token-A contamination");
+    }
+
+    // ============================================================
+    // V3 PHASE 3: MID-FLUSH pauseWithdraw
+    // ============================================================
+
+    function test_midflush_pauseWithdraw_leaves_flush_consistent() public {
+        _setupActivePromoHalfStreamed();
+        uint256 bobPending = phlimbo.pendingPromo(bob);
+
+        phlimbo.beginFlush();
+
+        // alice fully exits via pauseWithdraw mid-flush: forfeits her promo pending,
+        // set membership untouched (frozen while paused)
+        vm.prank(alice);
+        phlimbo.pauseWithdraw(STAKE_AMOUNT);
+        assertEq(phlimbo.stakerCount(), 2, "set frozen during flush");
+        assertEq(phlimbo.pendingPromo(alice), 0, "pauseWithdraw realigned promoDebt");
+
+        // Flush visits alice with zero pending (harmless) and pays bob
+        phlimbo.batchClaim(10);
+        assertEq(phlimbo.flushCursor(), 2);
+        assertEq(partner.balanceOf(alice), 0, "alice forfeited promo");
+        assertEq(partner.balanceOf(bob), bobPending, "bob paid in full");
+
+        // Finalize sweeps alice's forfeited share with the leftover
+        address recipient = address(0x99);
+        uint256 contractPromoBalance = partner.balanceOf(address(phlimbo));
+        phlimbo.finalizePromotion(recipient);
+        assertEq(partner.balanceOf(recipient), contractPromoBalance, "forfeit swept as leftover");
+    }
+
+    // ============================================================
+    // V3 PHASE 3: FAILED TRANSFER BANKING
+    // ============================================================
+
+    function test_batchClaim_failed_transfer_banks_unclaimable_and_continues() public {
+        MockBlocklistToken blk = new MockBlocklistToken();
+        blk.mint(owner, PROMO_AMOUNT);
+        blk.approve(address(phlimbo), type(uint256).max);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT * 3, bob);
+
+        phlimbo.startPromotion(address(blk), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        uint256 alicePending = phlimbo.pendingPromo(alice);
+        uint256 bobPending = phlimbo.pendingPromo(bob);
+
+        blk.setBlocked(alice, true);
+
+        phlimbo.beginFlush();
+
+        vm.expectEmit(true, false, false, true);
+        emit PromoClaimFailed(alice, alicePending);
+        phlimbo.batchClaim(10);
+
+        assertEq(phlimbo.flushCursor(), 2, "flush continued past failure");
+        assertEq(blk.balanceOf(alice), 0, "blocked transfer did not pay");
+        assertEq(blk.balanceOf(bob), bobPending, "bob still paid");
+        assertEq(phlimbo.unclaimablePromo(), alicePending, "failed amount banked");
+        assertEq(phlimbo.pendingPromo(alice), 0, "debt still aligned on failure");
+
+        // Sweep includes the banked amount; slot + banked counter cleared
+        address recipient = address(0x99);
+        uint256 contractBalance = blk.balanceOf(address(phlimbo));
+        assertGe(contractBalance, alicePending, "banked tokens still in contract");
+
+        phlimbo.finalizePromotion(recipient);
+        assertEq(blk.balanceOf(recipient), contractBalance, "leftover + unclaimable swept");
+        assertEq(phlimbo.unclaimablePromo(), 0, "unclaimablePromo cleared");
+    }
+
+    // ============================================================
+    // V3 PHASE 3: FINALIZE SWEEP + SLOT ZEROING
+    // ============================================================
+
+    function test_finalizePromotion_sweeps_leftover_and_zeroes_slot() public {
+        _setupActivePromoHalfStreamed();
+
+        phlimbo.beginFlush();
+        phlimbo.batchClaim(10);
+
+        // Promo cut short at half window: ~Q/2 undistributed remains in the contract
+        address recipient = address(0x99);
+        uint256 leftover = partner.balanceOf(address(phlimbo));
+        assertEq(leftover, PROMO_AMOUNT / 2, "half of Q left over");
+
+        uint256 accBefore = phlimbo.accPromoPerShare();
+
+        vm.expectEmit(true, true, false, true);
+        emit PromotionFinalized(address(partner), recipient, leftover);
+        phlimbo.finalizePromotion(recipient);
+
+        assertEq(partner.balanceOf(recipient), leftover, "leftover swept");
+        assertEq(partner.balanceOf(address(phlimbo)), 0);
+
+        // Slot cleared…
+        assertEq(address(phlimbo.promoToken()), address(0));
+        assertEq(phlimbo.promoRewardPerSecond(), 0);
+        assertEq(phlimbo.promoRewardBalance(), 0);
+        assertEq(uint256(phlimbo.promoPhase()), uint256(IPhlimboV3.PromoPhase.None));
+        // …but the accumulator is NEVER reset
+        assertEq(phlimbo.accPromoPerShare(), accBefore, "accPromoPerShare NOT reset");
+
+        // Rotation complete: a fresh promotion can start after unpause
+        phlimbo.unpause();
+        partner.mint(owner, PROMO_AMOUNT);
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+        assertEq(uint256(phlimbo.promoPhase()), uint256(IPhlimboV3.PromoPhase.Active));
+    }
+
+    function test_finalizePromotion_empty_staker_set_immediate() public {
+        // No stakers: cursor 0 == length 0, finalize allowed right after beginFlush
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+        phlimbo.beginFlush();
+
+        address recipient = address(0x99);
+        phlimbo.finalizePromotion(recipient);
+        assertEq(partner.balanceOf(recipient), PROMO_AMOUNT, "full Q swept with no stakers");
+        assertEq(uint256(phlimbo.promoPhase()), uint256(IPhlimboV3.PromoPhase.None));
+    }
+
+    // ============================================================
+    // V3 PHASE 3: emergencyTransfer SWEEPS PROMO TOKEN
+    // ============================================================
+
+    function test_emergencyTransfer_sweeps_promo_token() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(rewardDonor);
+        phlimbo.collectReward(100 ether);
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+
+        address recipient = address(0x99);
+        phlimbo.emergencyTransfer(recipient);
+
+        assertEq(partner.balanceOf(recipient), PROMO_AMOUNT, "promo token swept");
+        assertEq(rewardToken.balanceOf(recipient), 100 ether, "reward token swept");
+        assertEq(phUSD.balanceOf(recipient), STAKE_AMOUNT, "phUSD swept");
+        assertEq(partner.balanceOf(address(phlimbo)), 0);
     }
 }

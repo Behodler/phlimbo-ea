@@ -394,6 +394,28 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         emit PromoDepletionDurationUpdated(oldDuration, duration);
     }
 
+    // ========================== PROMO ROTATION (FLUSH) ==========================
+
+    /**
+     * @notice Begins the rotation flush (stub)
+     */
+    function beginFlush() external onlyOwner {}
+
+    /**
+     * @notice Processes a chunk of the flush (stub)
+     */
+    function batchClaim(uint256 maxIterations) external {}
+
+    /**
+     * @notice Finalizes the rotation (stub)
+     */
+    function finalizePromotion(address leftoverRecipient) external onlyOwner {}
+
+    /**
+     * @notice Aborts an in-progress flush (stub)
+     */
+    function abortFlush() external onlyOwner {}
+
     // ========================== PAUSE MECHANISM ==========================
 
     /**
