@@ -263,9 +263,13 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     /**
      * @notice Unpauses the contract
      * @dev V3: owner may unpause directly in addition to the external pauser.
+     *      Reverts while a flush is in progress — the only exits from Flushing are
+     *      finalizePromotion or abortFlush, so no path exists where users transact
+     *      against a half-rotated promo slot.
      */
     function unpause() public override {
         require(msg.sender == pauser || msg.sender == owner(), "Only pauser or owner can unpause");
+        require(promoPhase != PromoPhase.Flushing, "Cannot unpause while flushing");
         _unpause();
     }
 
@@ -298,6 +302,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
     /**
      * @notice Emergency function to transfer all tokens to a recipient
+     * @dev V3: also sweeps the promo token when a promotion slot is set.
      */
     function emergencyTransfer(address recipient) external onlyOwner {
         uint256 phUSDBalance = phUSD.balanceOf(address(this));
@@ -308,6 +313,12 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         }
         if (rewardTokenBalance > 0) {
             rewardToken.safeTransfer(recipient, rewardTokenBalance);
+        }
+        if (address(promoToken) != address(0)) {
+            uint256 promoBalance = promoToken.balanceOf(address(this));
+            if (promoBalance > 0) {
+                promoToken.safeTransfer(recipient, promoBalance);
+            }
         }
 
         _pause();
@@ -397,24 +408,105 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     // ========================== PROMO ROTATION (FLUSH) ==========================
 
     /**
-     * @notice Begins the rotation flush (stub)
+     * @notice Begins the rotation flush: final promo accrual up to now, then pause.
+     *         Phase Active → Flushing.
+     * @dev Pausing blocks all whenNotPaused ops, so from this point accPromoPerShare,
+     *      every user's amount (except pauseWithdraw, which realigns debts), and the
+     *      staker set are frozen. `_pause()` reverts if already paused — a flush
+     *      cannot be started over an unrelated pause.
      */
-    function beginFlush() external onlyOwner {}
+    function beginFlush() external onlyOwner {
+        require(promoPhase == PromoPhase.Active, "Promo phase must be Active");
+
+        _updatePool();
+        _pause();
+
+        flushCursor = 0;
+        promoPhase = PromoPhase.Flushing;
+    }
 
     /**
-     * @notice Processes a chunk of the flush (stub)
+     * @notice Processes up to `maxIterations` stakers from the flush cursor: pays each
+     *         staker's pending promo TO THE STAKER DIRECTLY (forced claim — beneficiary
+     *         is the user, unlike the V2 caller-routing of ordinary claims) and aligns
+     *         their promoDebt to the current accumulator.
+     * @dev Permissionless: recipients and amounts are fixed by state, so anyone may
+     *      help complete a flush. Failed transfers (e.g. blocklisted recipients) are
+     *      banked into `unclaimablePromo` — the flush must never brick. Touches ONLY
+     *      promo state; stable/phUSD pendings are untouched.
      */
-    function batchClaim(uint256 maxIterations) external {}
+    function batchClaim(uint256 maxIterations) external nonReentrant {
+        require(promoPhase == PromoPhase.Flushing, "Promo phase must be Flushing");
+
+        uint256 len = _stakers.length();
+        uint256 cursor = flushCursor;
+        uint256 end = cursor + maxIterations;
+        if (end > len) {
+            end = len;
+        }
+
+        for (; cursor < end; cursor++) {
+            address staker = _stakers.at(cursor);
+            UserInfo storage userDetails = userInfo[staker];
+
+            uint256 pending = (userDetails.amount * accPromoPerShare) / PRECISION - userDetails.promoDebt;
+
+            // Align the debt unconditionally: the next promotion continues on the
+            // same accumulator, so every debt must sit exactly at it (§2.1).
+            userDetails.promoDebt = (userDetails.amount * accPromoPerShare) / PRECISION;
+
+            if (pending > 0) {
+                if (_tryTransfer(promoToken, staker, pending)) {
+                    emit PromoClaimed(staker, pending);
+                } else {
+                    unclaimablePromo += pending;
+                    emit PromoClaimFailed(staker, pending);
+                }
+            }
+        }
+
+        flushCursor = cursor;
+        emit FlushProgress(cursor, len);
+    }
 
     /**
-     * @notice Finalizes the rotation (stub)
+     * @notice Finalizes the rotation: requires full cursor coverage of the frozen
+     *         staker set. Sweeps the remaining promo token balance (undistributed
+     *         remainder, rounding dust, and unclaimablePromo) to `leftoverRecipient`.
+     *         Phase Flushing → None; owner then unpauses.
+     * @dev `accPromoPerShare` is deliberately NOT reset (§2.1): all debts were aligned
+     *      to it by the flush, so pending against the next token starts at exactly
+     *      zero. Zeroing it while debts are non-zero would underflow amount*acc − debt.
      */
-    function finalizePromotion(address leftoverRecipient) external onlyOwner {}
+    function finalizePromotion(address leftoverRecipient) external onlyOwner {
+        require(promoPhase == PromoPhase.Flushing, "Promo phase must be Flushing");
+        require(flushCursor == _stakers.length(), "Flush incomplete");
+        require(leftoverRecipient != address(0), "Invalid recipient");
+
+        IERC20 retiredToken = promoToken;
+        uint256 leftover = retiredToken.balanceOf(address(this));
+        if (leftover > 0) {
+            retiredToken.safeTransfer(leftoverRecipient, leftover);
+        }
+
+        promoToken = IERC20(address(0));
+        promoRewardPerSecond = 0;
+        promoRewardBalance = 0;
+        unclaimablePromo = 0;
+        promoPhase = PromoPhase.None;
+
+        emit PromotionFinalized(address(retiredToken), leftoverRecipient, leftover);
+    }
 
     /**
-     * @notice Aborts an in-progress flush (stub)
+     * @notice Aborts an in-progress flush, returning to Active; owner may then unpause.
+     * @dev Always safe: batchClaim is just early forced claims with debts correctly
+     *      aligned, so a partial flush leaves fully consistent state.
      */
-    function abortFlush() external onlyOwner {}
+    function abortFlush() external onlyOwner {
+        require(promoPhase == PromoPhase.Flushing, "Promo phase must be Flushing");
+        promoPhase = PromoPhase.Active;
+    }
 
     // ========================== PAUSE MECHANISM ==========================
 
@@ -713,6 +805,18 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
                 emit PromoClaimed(user, pendingPromoAmount);
             }
         }
+    }
+
+    /**
+     * @notice Non-reverting ERC20 transfer used by the flush: a single blocklisted or
+     *         otherwise reverting recipient must not brick batchClaim.
+     * @return success True if the transfer succeeded (call succeeded and returned
+     *         either nothing or true).
+     */
+    function _tryTransfer(IERC20 token, address to, uint256 amount) internal returns (bool success) {
+        (bool callSuccess, bytes memory returndata) =
+            address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        return callSuccess && (returndata.length == 0 || abi.decode(returndata, (bool)));
     }
 
     /**
