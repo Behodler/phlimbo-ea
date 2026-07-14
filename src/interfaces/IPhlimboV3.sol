@@ -70,6 +70,79 @@ interface IPhlimboV3 {
      */
     event HookSet(address indexed oldHook, address indexed newHook);
 
+    // ========================== PROMO EVENTS ==========================
+
+    /**
+     * @notice Emitted when a new promotion is started
+     * @param token Partner token being streamed
+     * @param amount Quantity supplied
+     * @param duration Promo depletion window in seconds
+     * @param rate Resulting promoRewardPerSecond (scaled by PRECISION)
+     */
+    event PromotionStarted(address indexed token, uint256 amount, uint256 duration, uint256 rate);
+
+    /**
+     * @notice Emitted when the active promotion is topped up
+     * @param amount Quantity added
+     * @param newBalance New undistributed promo balance
+     * @param newRate Recomputed promoRewardPerSecond
+     */
+    event PromotionToppedUp(uint256 amount, uint256 newBalance, uint256 newRate);
+
+    /**
+     * @notice Emitted when the promo depletion window is changed
+     */
+    event PromoDepletionDurationUpdated(uint256 oldDuration, uint256 newDuration);
+
+    /**
+     * @notice Emitted when promo rewards are paid to a user (settlement or flush)
+     * @param user Address whose accrued promo rewards were drained
+     * @param amount Amount of promo tokens paid
+     */
+    event PromoClaimed(address indexed user, uint256 amount);
+
+    // ========================== PROMO LIFECYCLE (OWNER) ==========================
+
+    /**
+     * @notice Starts a new promotion: pulls `amount` of `token` from the owner and
+     *         streams it linearly over `duration`. Requires phase None.
+     * @param token Partner token (not zero / phUSD / rewardToken; standard ERC20 only)
+     * @param amount Fixed quantity to stream
+     * @param duration Promo depletion window in seconds
+     */
+    function startPromotion(address token, uint256 amount, uint256 duration) external;
+
+    /**
+     * @notice Adds `amount` of the current promo token and recomputes the rate over
+     *         the existing window. Reactivates a dormant stream. Requires phase Active.
+     */
+    function topUpPromotion(uint256 amount) external;
+
+    /**
+     * @notice Changes the promo depletion window and recomputes the rate.
+     *         Requires phase Active.
+     */
+    function setPromoDepletionDuration(uint256 duration) external;
+
+    // ========================== PROMO VIEWS ==========================
+
+    /**
+     * @notice Returns pending promo rewards for a user
+     */
+    function pendingPromo(address user) external view returns (uint256);
+
+    /**
+     * @notice Returns current promotional slot information
+     */
+    function getPromoInfo() external view returns (
+        address _promoToken,
+        uint256 _promoRewardBalance,
+        uint256 _promoRewardPerSecond,
+        uint256 _promoDepletionDuration,
+        PromoPhase _promoPhase,
+        uint256 _flushCursor
+    );
+
     // ========================== ADMIN FUNCTIONS ==========================
 
     /**

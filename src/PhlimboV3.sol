@@ -313,6 +313,23 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         _pause();
     }
 
+    // ========================== PROMO LIFECYCLE (OWNER) ==========================
+
+    /**
+     * @notice Starts a new promotion (stub)
+     */
+    function startPromotion(address token, uint256 amount, uint256 duration) external onlyOwner {}
+
+    /**
+     * @notice Tops up the active promotion (stub)
+     */
+    function topUpPromotion(uint256 amount) external onlyOwner {}
+
+    /**
+     * @notice Changes the promo depletion window (stub)
+     */
+    function setPromoDepletionDuration(uint256 duration) external onlyOwner {}
+
     // ========================== PAUSE MECHANISM ==========================
 
     /**
@@ -632,6 +649,34 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         }
 
         return (userDetails.amount * _accStablePerShare) / PRECISION - userDetails.stableDebt;
+    }
+
+    /**
+     * @notice Returns pending promo rewards for a user (stub)
+     */
+    function pendingPromo(address user) external view returns (uint256) {
+        return 0;
+    }
+
+    /**
+     * @notice Returns current promotional slot information
+     */
+    function getPromoInfo() external view returns (
+        address _promoToken,
+        uint256 _promoRewardBalance,
+        uint256 _promoRewardPerSecond,
+        uint256 _promoDepletionDuration,
+        PromoPhase _promoPhase,
+        uint256 _flushCursor
+    ) {
+        return (
+            address(promoToken),
+            promoRewardBalance,
+            promoRewardPerSecond,
+            promoDepletionDuration,
+            promoPhase,
+            flushCursor
+        );
     }
 
     /**

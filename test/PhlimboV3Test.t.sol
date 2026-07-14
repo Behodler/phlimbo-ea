@@ -28,10 +28,15 @@ contract PhlimboV3Test is Test {
     event RewardsClaimed(address indexed user, uint256 phUSDAmount, uint256 stableAmount);
     event MigratorSet(address indexed oldMigrator, address indexed newMigrator);
     event HookSet(address indexed oldHook, address indexed newHook);
+    event PromotionStarted(address indexed token, uint256 amount, uint256 duration, uint256 rate);
+    event PromotionToppedUp(uint256 amount, uint256 newBalance, uint256 newRate);
+    event PromoDepletionDurationUpdated(uint256 oldDuration, uint256 newDuration);
+    event PromoClaimed(address indexed user, uint256 amount);
 
     PhlimboV3 public phlimbo;
     MockFlax public phUSD;
     MockStable public rewardToken;
+    MockStable public partner;
 
     address public owner = address(this);
     address public alice = address(0x1);
@@ -44,6 +49,8 @@ contract PhlimboV3Test is Test {
     uint256 constant INITIAL_BALANCE = 10000 ether;
     uint256 constant STAKE_AMOUNT = 1000 ether;
     uint256 constant DEPLETION_DURATION = 604800; // 1 week
+    uint256 constant PROMO_AMOUNT = 1000 ether;
+    uint256 constant PROMO_DURATION = 1_000_000; // promo's own window, != DEPLETION_DURATION
 
     function setUp() public {
         phUSD = new MockFlax();
@@ -72,6 +79,11 @@ contract PhlimboV3Test is Test {
         rewardToken.approve(address(phlimbo), type(uint256).max);
 
         phlimbo.setPauser(pauser);
+
+        // Partner token for the promotional slot: owner (this) holds and approves it
+        partner = new MockStable();
+        partner.mint(owner, INITIAL_BALANCE);
+        partner.approve(address(phlimbo), type(uint256).max);
     }
 
     // ============================================================
@@ -1010,5 +1022,338 @@ contract PhlimboV3Test is Test {
         assertEq(amount, 0);
         assertEq(phlimbo.stakerCount(), 1, "alice still enumerated while paused");
         assertEq(phlimbo.stakerAt(0), alice);
+    }
+
+    // ============================================================
+    // V3 PHASE 2: startPromotion VALIDATION
+    // ============================================================
+
+    function test_startPromotion_only_owner() public {
+        vm.prank(eve);
+        vm.expectRevert();
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+    }
+
+    function test_startPromotion_requires_phase_none() public {
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+
+        vm.expectRevert("Promo phase must be None");
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+    }
+
+    function test_startPromotion_rejects_invalid_tokens() public {
+        vm.expectRevert("Invalid promo token");
+        phlimbo.startPromotion(address(0), PROMO_AMOUNT, PROMO_DURATION);
+
+        vm.expectRevert("Invalid promo token");
+        phlimbo.startPromotion(address(phUSD), PROMO_AMOUNT, PROMO_DURATION);
+
+        vm.expectRevert("Invalid promo token");
+        phlimbo.startPromotion(address(rewardToken), PROMO_AMOUNT, PROMO_DURATION);
+    }
+
+    function test_startPromotion_rejects_zero_amount_or_duration() public {
+        vm.expectRevert("Amount must be greater than 0");
+        phlimbo.startPromotion(address(partner), 0, PROMO_DURATION);
+
+        vm.expectRevert("Duration must be > 0");
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, 0);
+    }
+
+    function test_startPromotion_blocked_while_paused() public {
+        vm.prank(pauser);
+        phlimbo.pause();
+
+        vm.expectRevert();
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+    }
+
+    function test_startPromotion_pulls_tokens_and_sets_state() public {
+        uint256 ownerBefore = partner.balanceOf(owner);
+        uint256 expectedRate = (PROMO_AMOUNT * 1e18) / PROMO_DURATION;
+
+        vm.expectEmit(true, false, false, true);
+        emit PromotionStarted(address(partner), PROMO_AMOUNT, PROMO_DURATION, expectedRate);
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+
+        assertEq(partner.balanceOf(owner), ownerBefore - PROMO_AMOUNT, "tokens pulled from owner");
+        assertEq(partner.balanceOf(address(phlimbo)), PROMO_AMOUNT);
+        assertEq(address(phlimbo.promoToken()), address(partner));
+        assertEq(phlimbo.promoRewardBalance(), PROMO_AMOUNT);
+        assertEq(phlimbo.promoDepletionDuration(), PROMO_DURATION);
+        assertEq(phlimbo.promoRewardPerSecond(), expectedRate);
+        assertEq(uint256(phlimbo.promoPhase()), uint256(IPhlimboV3.PromoPhase.Active));
+
+        (address t, uint256 bal, uint256 rate, uint256 window, IPhlimboV3.PromoPhase phase, uint256 cursor) =
+            phlimbo.getPromoInfo();
+        assertEq(t, address(partner));
+        assertEq(bal, PROMO_AMOUNT);
+        assertEq(rate, expectedRate);
+        assertEq(window, PROMO_DURATION);
+        assertEq(uint256(phase), uint256(IPhlimboV3.PromoPhase.Active));
+        assertEq(cursor, 0);
+    }
+
+    function test_startPromotion_rejects_fee_on_transfer_token() public {
+        MockFeeToken feeToken = new MockFeeToken();
+        feeToken.mint(owner, INITIAL_BALANCE);
+        feeToken.approve(address(phlimbo), type(uint256).max);
+
+        vm.expectRevert("Fee-on-transfer not supported");
+        phlimbo.startPromotion(address(feeToken), PROMO_AMOUNT, PROMO_DURATION);
+    }
+
+    // ============================================================
+    // V3 PHASE 2: PROMO ACCRUAL
+    // ============================================================
+
+    function test_promo_streams_linearly_over_own_window() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+        assertEq(phlimbo.pendingPromo(alice), PROMO_AMOUNT / 2, "half streamed at half window");
+
+        vm.warp(block.timestamp + PROMO_DURATION / 4);
+        assertEq(phlimbo.pendingPromo(alice), (PROMO_AMOUNT * 3) / 4, "3/4 streamed at 3/4 window");
+
+        // Claim delivers the promo tokens to the user
+        uint256 before = partner.balanceOf(alice);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+        assertEq(partner.balanceOf(alice) - before, (PROMO_AMOUNT * 3) / 4, "claim pays promo");
+        assertEq(phlimbo.pendingPromo(alice), 0, "pending zero after claim");
+    }
+
+    function test_promo_pro_rata_split_between_stakers() public {
+        // alice : bob = 1 : 3, both staked before the promo starts
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT * 3, bob);
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        assertEq(phlimbo.pendingPromo(alice), PROMO_AMOUNT / 8, "alice gets 1/4 of half");
+        assertEq(phlimbo.pendingPromo(bob), (PROMO_AMOUNT * 3) / 8, "bob gets 3/4 of half");
+    }
+
+    function test_promo_window_independent_of_stable_window() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        // Stable stream: 100 ether over DEPLETION_DURATION.
+        // Promo stream: PROMO_AMOUNT over 2 * DEPLETION_DURATION.
+        vm.prank(rewardDonor);
+        phlimbo.collectReward(100 ether);
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, 2 * DEPLETION_DURATION);
+
+        // After one stable window: stable fully depleted, promo only half done.
+        vm.warp(block.timestamp + DEPLETION_DURATION);
+
+        assertApproxEqRel(phlimbo.pendingStable(alice), 100 ether, 0.0001e18, "stable fully streamed");
+        assertApproxEqRel(phlimbo.pendingPromo(alice), PROMO_AMOUNT / 2, 0.0001e18, "promo half streamed");
+
+        // Changing the stable window must not touch the promo rate, and vice versa
+        uint256 promoRate = phlimbo.promoRewardPerSecond();
+        phlimbo.setDepletionDuration(DEPLETION_DURATION / 2);
+        assertEq(phlimbo.promoRewardPerSecond(), promoRate, "stable window change leaves promo rate");
+
+        uint256 stableRate = phlimbo.rewardPerSecond();
+        phlimbo.setPromoDepletionDuration(DEPLETION_DURATION);
+        assertEq(phlimbo.rewardPerSecond(), stableRate, "promo window change leaves stable rate");
+    }
+
+    function test_promo_depletes_then_dormant_then_topUp_resumes() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+
+        // Warp far past the window: distribution capped at the supplied quantity
+        vm.warp(block.timestamp + PROMO_DURATION * 3);
+        assertEq(phlimbo.pendingPromo(alice), PROMO_AMOUNT, "capped at Q");
+
+        vm.prank(alice);
+        phlimbo.claim(alice);
+        assertEq(partner.balanceOf(alice), PROMO_AMOUNT);
+        assertEq(phlimbo.promoRewardBalance(), 0, "balance depleted");
+
+        // Dormant: time passes, nothing accrues
+        vm.warp(block.timestamp + PROMO_DURATION);
+        assertEq(phlimbo.pendingPromo(alice), 0, "dormant stream accrues nothing");
+
+        // Top-up reactivates: new rate = newBalance / window
+        uint256 topUp = 400 ether;
+        partner.mint(owner, topUp);
+        uint256 expectedRate = (topUp * 1e18) / PROMO_DURATION;
+        vm.expectEmit(false, false, false, true);
+        emit PromotionToppedUp(topUp, topUp, expectedRate);
+        phlimbo.topUpPromotion(topUp);
+        assertEq(phlimbo.promoRewardPerSecond(), expectedRate);
+
+        vm.warp(block.timestamp + PROMO_DURATION / 4);
+        assertEq(phlimbo.pendingPromo(alice), topUp / 4, "stream resumed after top-up");
+    }
+
+    function test_topUpPromotion_requires_active_and_recomputes_rate() public {
+        vm.expectRevert("Promo phase must be Active");
+        phlimbo.topUpPromotion(100 ether);
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+
+        vm.prank(eve);
+        vm.expectRevert();
+        phlimbo.topUpPromotion(100 ether);
+
+        // Mid-stream top-up: accrues first, then rate = remaining balance / window
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        phlimbo.topUpPromotion(100 ether);
+        // Remaining ~PROMO_AMOUNT/2 + 100
+        uint256 expectedBalance = PROMO_AMOUNT / 2 + 100 ether;
+        assertApproxEqRel(phlimbo.promoRewardBalance(), expectedBalance, 0.0001e18);
+        assertEq(
+            phlimbo.promoRewardPerSecond(),
+            (phlimbo.promoRewardBalance() * 1e18) / PROMO_DURATION,
+            "rate recomputed over existing window"
+        );
+    }
+
+    function test_setPromoDepletionDuration_accrues_then_recomputes() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+
+        vm.expectRevert("Duration must be > 0");
+        phlimbo.setPromoDepletionDuration(0);
+
+        vm.prank(eve);
+        vm.expectRevert();
+        phlimbo.setPromoDepletionDuration(PROMO_DURATION / 4);
+
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        vm.expectEmit(false, false, false, true);
+        emit PromoDepletionDurationUpdated(PROMO_DURATION, PROMO_DURATION / 4);
+        phlimbo.setPromoDepletionDuration(PROMO_DURATION / 4);
+
+        // Old-rate accrual happened first (half distributed), then recompute
+        assertApproxEqRel(phlimbo.promoRewardBalance(), PROMO_AMOUNT / 2, 0.0001e18);
+        assertEq(
+            phlimbo.promoRewardPerSecond(),
+            (phlimbo.promoRewardBalance() * 1e18) / (PROMO_DURATION / 4),
+            "rate recomputed over new window"
+        );
+        assertEq(phlimbo.promoDepletionDuration(), PROMO_DURATION / 4);
+
+        // Remaining half distributes over the shortened window
+        vm.warp(block.timestamp + PROMO_DURATION / 4);
+        assertApproxEqRel(phlimbo.pendingPromo(alice), PROMO_AMOUNT, 0.0001e18, "fully streamed");
+    }
+
+    function test_setPromoDepletionDuration_requires_active() public {
+        vm.expectRevert("Promo phase must be Active");
+        phlimbo.setPromoDepletionDuration(PROMO_DURATION);
+    }
+
+    function test_promo_6_decimal_partner_token() public {
+        MockUSDC6 usdc = new MockUSDC6();
+        uint256 q = 1000e6; // 1000 USDC in native 6 decimals
+        usdc.mint(owner, q);
+        usdc.approve(address(phlimbo), type(uint256).max);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT, bob);
+
+        phlimbo.startPromotion(address(usdc), q, PROMO_DURATION);
+
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        // Equal stakes: each gets ~q/4 at half window, in native 6-dp units
+        assertApproxEqAbs(phlimbo.pendingPromo(alice), q / 4, 2, "alice 6dp pending");
+        assertApproxEqAbs(phlimbo.pendingPromo(bob), q / 4, 2, "bob 6dp pending");
+
+        vm.prank(alice);
+        phlimbo.claim(alice);
+        assertApproxEqAbs(usdc.balanceOf(alice), q / 4, 2, "alice paid in 6dp token");
+    }
+
+    function test_zero_slot_ops_no_promo_transfers_debts_realigned() public {
+        // No promotion configured: full user surface works, no promo effects
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        vm.prank(rewardDonor);
+        phlimbo.collectReward(100 ether);
+        vm.warp(block.timestamp + 1000);
+
+        vm.prank(alice);
+        phlimbo.claim(alice);
+
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT / 2, alice);
+
+        assertEq(phlimbo.pendingPromo(alice), 0);
+        (,,, uint256 promoDebt) = phlimbo.userInfo(alice);
+        assertEq(promoDebt, 0, "promoDebt aligned to zero accumulator");
+        assertEq(partner.balanceOf(alice), 0, "no promo tokens moved");
+    }
+
+    function test_promo_settlement_on_stake_and_withdraw() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+
+        // Stake more mid-stream: pending promo is auto-claimed, debt realigned
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+        uint256 pendingAtStake = phlimbo.pendingPromo(alice);
+        assertEq(pendingAtStake, PROMO_AMOUNT / 2);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        assertEq(partner.balanceOf(alice), pendingAtStake, "stake auto-claims promo");
+        assertEq(phlimbo.pendingPromo(alice), 0);
+
+        // Withdraw mid-stream: same
+        vm.warp(block.timestamp + PROMO_DURATION / 4);
+        uint256 pendingAtWithdraw = phlimbo.pendingPromo(alice);
+        assertEq(pendingAtWithdraw, PROMO_AMOUNT / 4);
+
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT, alice);
+        assertEq(
+            partner.balanceOf(alice),
+            pendingAtStake + pendingAtWithdraw,
+            "withdraw auto-claims promo"
+        );
+        assertEq(phlimbo.pendingPromo(alice), 0);
+    }
+
+    function test_migrator_claim_routes_promo_to_migrator() public {
+        phlimbo.setMigrator(migrator);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        vm.prank(migrator);
+        phlimbo.claim(alice);
+
+        // V2 routing preserved: promo rewards go to the caller during delegation
+        assertEq(partner.balanceOf(migrator), PROMO_AMOUNT / 2, "migrator receives promo");
+        assertEq(partner.balanceOf(alice), 0, "alice receives nothing");
     }
 }

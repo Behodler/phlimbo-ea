@@ -53,6 +53,72 @@ contract MockStable is ERC20 {
 }
 
 /**
+ * @title MockUSDC6
+ * @notice Mock 6-decimal ERC20 (USDC-style) for partner-token decimals testing
+ */
+contract MockUSDC6 is ERC20 {
+    constructor() ERC20("Mock USDC", "mUSDC") {}
+
+    function decimals() public pure override returns (uint8) {
+        return 6;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
+/**
+ * @title MockFeeToken
+ * @notice Fee-on-transfer ERC20 (1% burned on every transfer) used to verify the
+ *         balance-delta guard in startPromotion/topUpPromotion.
+ */
+contract MockFeeToken is ERC20 {
+    constructor() ERC20("Mock Fee Token", "mFEE") {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        if (from != address(0) && to != address(0)) {
+            uint256 fee = value / 100;
+            super._update(from, to, value - fee);
+            if (fee > 0) {
+                super._update(from, address(0), fee);
+            }
+        } else {
+            super._update(from, to, value);
+        }
+    }
+}
+
+/**
+ * @title MockBlocklistToken
+ * @notice ERC20 with a USDT-style recipient blocklist. Transfers to a blocked
+ *         address revert — used to verify batchClaim's non-reverting transfer
+ *         path banks failed amounts into unclaimablePromo.
+ */
+contract MockBlocklistToken is ERC20 {
+    mapping(address => bool) public blocked;
+
+    constructor() ERC20("Mock Blocklist Token", "mBLK") {}
+
+    function setBlocked(address account, bool isBlocked) external {
+        blocked[account] = isBlocked;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        require(!blocked[to], "recipient blocked");
+        super._update(from, to, value);
+    }
+}
+
+/**
  * @title MockPhlimboHook
  * @notice Records every call from PhlimboV2 so tests can assert on caller/user/amount.
  */
