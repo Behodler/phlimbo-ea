@@ -1755,4 +1755,124 @@ contract PhlimboV3Test is Test {
         assertEq(phUSD.balanceOf(recipient), STAKE_AMOUNT, "phUSD swept");
         assertEq(partner.balanceOf(address(phlimbo)), 0);
     }
+
+    // ============================================================
+    // GAS SNAPSHOT SCENARIOS (documenting plan §2's gas claims)
+    // ------------------------------------------------------------
+    // Named so `forge snapshot` records stake/withdraw/claim costs
+    // with the promo slot empty vs active vs dormant, and the
+    // per-user cost of the flush. Compare lines in .gas-snapshot.
+    // ============================================================
+
+    /// @dev alice staked with stable rewards flowing; promo slot per `mode`:
+    ///      0 = empty (no promotion), 1 = active, 2 = dormant (depleted, token set).
+    function _setupGasScenario(uint256 mode) internal {
+        vm.pauseGasMetering();
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(rewardDonor);
+        phlimbo.collectReward(100 ether);
+
+        if (mode == 1) {
+            phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+        } else if (mode == 2) {
+            phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+            vm.warp(block.timestamp + PROMO_DURATION * 2); // stream past its window
+        }
+
+        // Let every stream accrue, then settle, so all three scenarios measure the
+        // op against warm, populated storage slots (accumulators, debts, balances all
+        // non-zero) and freshly-aligned state. Mode 2's settle claim also depletes
+        // the promo → dormant.
+        vm.warp(block.timestamp + 1000);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+
+        // Mode 2's long warp also depleted the stable stream — refill it so every
+        // scenario measures with a live stable stream and only the promo slot differs.
+        if (mode == 2) {
+            vm.prank(rewardDonor);
+            phlimbo.collectReward(100 ether);
+        }
+
+        vm.warp(block.timestamp + 1000);
+        vm.resumeGasMetering();
+    }
+
+    function test_gas_stake_promoEmpty() public {
+        _setupGasScenario(0);
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+    }
+
+    function test_gas_stake_promoActive() public {
+        _setupGasScenario(1);
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+    }
+
+    function test_gas_stake_promoDormant() public {
+        _setupGasScenario(2);
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+    }
+
+    function test_gas_withdraw_promoEmpty() public {
+        _setupGasScenario(0);
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT / 2, alice);
+    }
+
+    function test_gas_withdraw_promoActive() public {
+        _setupGasScenario(1);
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT / 2, alice);
+    }
+
+    function test_gas_withdraw_promoDormant() public {
+        _setupGasScenario(2);
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT / 2, alice);
+    }
+
+    function test_gas_claim_promoEmpty() public {
+        _setupGasScenario(0);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+    }
+
+    function test_gas_claim_promoActive() public {
+        _setupGasScenario(1);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+    }
+
+    function test_gas_claim_promoDormant() public {
+        _setupGasScenario(2);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+    }
+
+    /// @dev Ten stakers flushed in one call — divide the snapshot line by 10 for the
+    ///      approximate per-user flush cost (each user: pending calc + debt write +
+    ///      promo transfer).
+    function test_gas_batchClaim_10_stakers() public {
+        vm.pauseGasMetering();
+        for (uint160 i = 1; i <= 10; i++) {
+            address staker = address(uint160(0x1000) + i);
+            phUSD.mint(staker, STAKE_AMOUNT);
+            vm.startPrank(staker);
+            phUSD.approve(address(phlimbo), type(uint256).max);
+            phlimbo.stake(STAKE_AMOUNT, staker);
+            vm.stopPrank();
+        }
+
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+        phlimbo.beginFlush();
+        vm.resumeGasMetering();
+
+        phlimbo.batchClaim(10);
+        assertEq(phlimbo.flushCursor(), 10);
+    }
 }
