@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+/**
+ * @title IMigratorV2V3
+ * @notice Interface for MigratorV2V3 — one-time, cooperation-free, chunked migration
+ *         of the PhlimboV2 user base into PhlimboV3 at the start of the first
+ *         promotion. Mirrors the MigratorV1V2 idioms (owner-seeded address list,
+ *         int256 cursor terminating at -1, withdrawAll escape hatch) with one
+ *         improvement: LIVE position reads from V2 instead of seeded balance
+ *         snapshots. Supports a straggler second pass: once a pass has completed
+ *         (migrateIterator == -1) the owner may reseed a new address list.
+ */
+interface IMigratorV2V3 {
+    // ========================== EVENTS ==========================
+
+    /**
+     * @notice Emitted whenever seedUsers (re)seeds an address list.
+     * @param userCount Number of V2 users seeded for this pass.
+     */
+    event Seeded(uint256 userCount);
+
+    /**
+     * @notice Emitted for each user actually migrated (non-zero live V2 position).
+     * @param user The migrated user.
+     * @param principal Live V2 staked amount moved into V3.
+     * @param phUSDRewards phUSD rewards forwarded to the user (V2 auto-claim delta,
+     *        plus any V3 auto-claim delta on a straggler second pass).
+     * @param stableRewards Stable-token rewards forwarded to the user.
+     * @param promoRewards Promo-token rewards forwarded to the user (non-zero only
+     *        on a second pass when the user already held a V3 position during an
+     *        active promotion; always zero on the first pass).
+     */
+    event UserMigrated(
+        address indexed user,
+        uint256 principal,
+        uint256 phUSDRewards,
+        uint256 stableRewards,
+        uint256 promoRewards
+    );
+
+    /**
+     * @notice Emitted at the end of each migrate call.
+     * @param iterator Updated migrateIterator (-1 when the pass is complete).
+     * @param userCount Total size of the currently seeded address list.
+     */
+    event MigrateProgress(int256 iterator, uint256 userCount);
+
+    /**
+     * @notice Emitted when withdrawAll sweeps stranded balances to the owner.
+     * @param owner Owner that received the balances.
+     * @param phUSDAmount Amount of phUSD transferred (may be 0).
+     * @param rewardAmount Amount of reward token transferred (may be 0).
+     */
+    event WithdrawnAll(address indexed owner, uint256 phUSDAmount, uint256 rewardAmount);
+
+    // ========================== FUNCTIONS ==========================
+
+    /**
+     * @notice Seeds (or, after a completed pass, reseeds) the address list to
+     *         migrate. Owner-only. No per-user amounts — positions are read live
+     *         from V2 during migrate. Reverts while a pass is in progress
+     *         (seeded && migrateIterator != -1).
+     * @param _users V2 staker addresses (off-chain enumeration).
+     */
+    function seedUsers(address[] calldata _users) external;
+
+    /**
+     * @notice Migrates up to `maxIterations` users from the cursor: live-reads each
+     *         user's V2 position, skips zero positions, withdraws the position from
+     *         V2 (principal + auto-claimed rewards land in this contract), forwards
+     *         the reward deltas to the user, and re-stakes the principal into V3 on
+     *         the user's behalf.
+     * @param maxIterations Maximum number of users to process in this call.
+     */
+    function migrate(uint256 maxIterations) external;
+
+    /**
+     * @notice Owner-only recovery sweep. Drains any stranded phUSD and reward-token
+     *         balance to the owner. Does not touch the seeded list or iterator —
+     *         with live reads there are no balance preconditions to break.
+     */
+    function withdrawAll() external;
+
+    /**
+     * @notice Returns the number of users in the currently seeded list.
+     */
+    function userCount() external view returns (uint256);
+}
