@@ -316,19 +316,83 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     // ========================== PROMO LIFECYCLE (OWNER) ==========================
 
     /**
-     * @notice Starts a new promotion (stub)
+     * @notice Starts a new promotion: pulls `amount` of `token` from the owner and
+     *         streams it linearly over `duration`. Phase None → Active.
+     * @dev Fee-on-transfer/rebasing tokens are rejected by policy; the balance-delta
+     *      check is the belt-and-braces guard. `_updatePool()` runs first so the promo
+     *      stream cannot retroactively accrue over time before the promotion existed.
      */
-    function startPromotion(address token, uint256 amount, uint256 duration) external onlyOwner {}
+    function startPromotion(address token, uint256 amount, uint256 duration) external onlyOwner whenNotPaused {
+        require(promoPhase == PromoPhase.None, "Promo phase must be None");
+        require(
+            token != address(0) && token != address(phUSD) && token != address(rewardToken),
+            "Invalid promo token"
+        );
+        require(amount > 0, "Amount must be greater than 0");
+        require(duration > 0, "Duration must be > 0");
+
+        // Advance shared lastRewardTime before the promo slot exists so the new
+        // stream starts accruing strictly from now.
+        _updatePool();
+
+        uint256 balanceBefore = IERC20(token).balanceOf(address(this));
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        require(
+            IERC20(token).balanceOf(address(this)) - balanceBefore == amount,
+            "Fee-on-transfer not supported"
+        );
+
+        promoToken = IERC20(token);
+        promoRewardBalance = amount;
+        promoDepletionDuration = duration;
+        promoRewardPerSecond = (amount * PRECISION) / duration;
+        promoPhase = PromoPhase.Active;
+
+        emit PromotionStarted(token, amount, duration, promoRewardPerSecond);
+    }
 
     /**
-     * @notice Tops up the active promotion (stub)
+     * @notice Adds `amount` of the current promo token and recomputes the rate over
+     *         the existing window (canonical recompute site, mirrors collectReward).
+     *         Reactivates a dormant stream. Requires phase Active.
      */
-    function topUpPromotion(uint256 amount) external onlyOwner {}
+    function topUpPromotion(uint256 amount) external onlyOwner {
+        require(promoPhase == PromoPhase.Active, "Promo phase must be Active");
+        require(amount > 0, "Amount must be greater than 0");
+
+        // Accrue at the old rate before changing balance/rate.
+        _updatePool();
+
+        uint256 balanceBefore = promoToken.balanceOf(address(this));
+        promoToken.safeTransferFrom(msg.sender, address(this), amount);
+        require(
+            promoToken.balanceOf(address(this)) - balanceBefore == amount,
+            "Fee-on-transfer not supported"
+        );
+
+        promoRewardBalance += amount;
+        promoRewardPerSecond = (promoRewardBalance * PRECISION) / promoDepletionDuration;
+
+        emit PromotionToppedUp(amount, promoRewardBalance, promoRewardPerSecond);
+    }
 
     /**
-     * @notice Changes the promo depletion window (stub)
+     * @notice Changes the promo depletion window and recomputes the rate over the
+     *         remaining balance (mirrors setDepletionDuration). Requires phase Active.
      */
-    function setPromoDepletionDuration(uint256 duration) external onlyOwner {}
+    function setPromoDepletionDuration(uint256 duration) external onlyOwner {
+        require(promoPhase == PromoPhase.Active, "Promo phase must be Active");
+        require(duration > 0, "Duration must be > 0");
+
+        // Accrue at the old rate over the old window first.
+        _updatePool();
+
+        uint256 oldDuration = promoDepletionDuration;
+        promoDepletionDuration = duration;
+        promoRewardPerSecond = (promoRewardBalance * PRECISION) / duration;
+
+        emit PromoDepletionDurationUpdated(oldDuration, duration);
+    }
 
     // ========================== PAUSE MECHANISM ==========================
 
@@ -519,6 +583,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
         userDetails.phUSDDebt = (userDetails.amount * accPhUSDPerShare) / PRECISION;
         userDetails.stableDebt = (userDetails.amount * accStablePerShare) / PRECISION;
+        userDetails.promoDebt = (userDetails.amount * accPromoPerShare) / PRECISION;
 
         if (address(hook) != address(0)) {
             hook.onClaim(msg.sender, user, pendingPhUSDAmount, pendingRewardAmount);
@@ -567,6 +632,21 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
             accPhUSDPerShare += (phUSDReward * PRECISION) / totalStaked;
         }
 
+        // Promo stream: capped linear depletion on the promo's OWN window, mirroring
+        // the stable block on separate variables. Skipped when no promotion is set.
+        // Rate is NEVER recomputed here (recompute lives only in topUpPromotion and
+        // setPromoDepletionDuration — the V2 bug-fix discipline).
+        if (address(promoToken) != address(0)) {
+            uint256 potentialPromo = (promoRewardPerSecond * timeElapsed) / PRECISION;
+            uint256 promoToDistribute =
+                potentialPromo > promoRewardBalance ? promoRewardBalance : potentialPromo;
+
+            if (promoToDistribute > 0) {
+                accPromoPerShare += (promoToDistribute * PRECISION) / totalStaked;
+                promoRewardBalance -= promoToDistribute;
+            }
+        }
+
         lastRewardTime = block.timestamp;
     }
 
@@ -597,6 +677,19 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         if (pendingPhUSDAmount > 0 || pendingRewardAmount > 0) {
             // Indexed by `user` (whose accrued rewards were drained), matching V1 semantics.
             emit RewardsClaimed(user, pendingPhUSDAmount, pendingRewardAmount);
+        }
+
+        // Promo settlement: pay pending promo when a promotion slot is set. When the
+        // slot is empty (promoToken == 0), all debts were aligned by the last flush,
+        // so pending is zero by construction and only the callers' debt realignment
+        // runs. Same beneficiary routing as phUSD/stable (caller during delegation).
+        if (address(promoToken) != address(0)) {
+            uint256 pendingPromoAmount =
+                (userDetails.amount * accPromoPerShare) / PRECISION - userDetails.promoDebt;
+            if (pendingPromoAmount > 0) {
+                promoToken.safeTransfer(beneficiary, pendingPromoAmount);
+                emit PromoClaimed(user, pendingPromoAmount);
+            }
         }
     }
 
@@ -652,10 +745,25 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     }
 
     /**
-     * @notice Returns pending promo rewards for a user (stub)
+     * @notice Returns pending promo rewards for a user
      */
     function pendingPromo(address user) external view returns (uint256) {
-        return 0;
+        UserInfo storage userDetails = userInfo[user];
+        uint256 _accPromoPerShare = accPromoPerShare;
+
+        if (address(promoToken) != address(0) && block.timestamp > lastRewardTime && totalStaked != 0) {
+            uint256 timeElapsed = block.timestamp - lastRewardTime;
+            uint256 potentialPromo = (promoRewardPerSecond * timeElapsed) / PRECISION;
+
+            uint256 promoToDistribute =
+                potentialPromo > promoRewardBalance ? promoRewardBalance : potentialPromo;
+
+            if (promoToDistribute > 0) {
+                _accPromoPerShare += (promoToDistribute * PRECISION) / totalStaked;
+            }
+        }
+
+        return (userDetails.amount * _accPromoPerShare) / PRECISION - userDetails.promoDebt;
     }
 
     /**
