@@ -54,11 +54,18 @@ import "./interfaces/IMigratorV2V3.sol";
  *         NO phUSD mint role is needed on this contract — V2 itself mints the
  *         pending phUSD rewards during `withdraw`.
  *
- *         Recovery note: reward forwarding uses `safeTransfer`, so a recipient that
- *         cannot receive the reward token (e.g. a blocklisted address) reverts the
- *         batch. As with MigratorV1V2, the operational escape is to exclude such
- *         addresses from the seed list (or deploy and re-wire a fresh migrator);
- *         `withdrawAll` recovers any balances stranded in this contract.
+ *         Recovery note: reward forwarding never reverts. Each delta is sent with
+ *         the non-reverting `_tryTransfer`; if a recipient cannot receive a token
+ *         (e.g. a blocklisted address), the amount is banked into the per-user
+ *         `unclaimable` mapping and `RewardForwardFailed` is emitted, so the cursor
+ *         always advances and a single bad recipient can never brick a pass. Banked
+ *         amounts are pulled by the affected user via the permissionless
+ *         `claimUnclaimable` once they can receive again. `withdrawAll` remains a
+ *         LAST-DITCH escape hatch: it sweeps this contract's ENTIRE phUSD,
+ *         reward-token and (live) promo-token balances, INCLUDING amounts banked in
+ *         `unclaimable`, leaving those claims unbacked. Reimbursing affected users
+ *         after such a sweep is an out-of-band owner obligation — the accepted
+ *         trade-off for keeping the emergency hatch unconditional and simple.
  */
 contract MigratorV2V3 is Ownable, ReentrancyGuard, IMigratorV2V3 {
     using SafeERC20 for IERC20;
@@ -79,6 +86,11 @@ contract MigratorV2V3 is Ownable, ReentrancyGuard, IMigratorV2V3 {
 
     /// @notice Migration cursor. 0 → users.length, then -1 when the pass completes.
     int256 public migrateIterator;
+
+    /// @notice token => user => reward amount that could not be forwarded during
+    ///         migrate. Banked by `_forward` when a recipient cannot receive a
+    ///         token; pulled by the user via `claimUnclaimable`.
+    mapping(address => mapping(address => uint256)) public unclaimable;
 
     // ========================== CONSTRUCTOR ==========================
 
@@ -183,14 +195,12 @@ contract MigratorV2V3 is Ownable, ReentrancyGuard, IMigratorV2V3 {
                 ? promoToken.balanceOf(address(this)) - promoBefore
                 : 0;
 
-            if (phUSDRewards > 0) {
-                IERC20(address(phUSD)).safeTransfer(user, phUSDRewards);
-            }
-            if (stableRewards > 0) {
-                rewardToken.safeTransfer(user, stableRewards);
-            }
-            if (promoRewards > 0) {
-                promoToken.safeTransfer(user, promoRewards);
+            // Non-reverting forwarding (audit-07 M-01): a recipient that cannot
+            // receive a token banks into `unclaimable` instead of bricking the pass.
+            _forward(IERC20(address(phUSD)), user, phUSDRewards);
+            _forward(rewardToken, user, stableRewards);
+            if (address(promoToken) != address(0)) {
+                _forward(promoToken, user, promoRewards);
             }
 
             emit UserMigrated(user, amount, phUSDRewards, stableRewards, promoRewards);
@@ -203,6 +213,23 @@ contract MigratorV2V3 is Ownable, ReentrancyGuard, IMigratorV2V3 {
         }
 
         emit MigrateProgress(migrateIterator, len);
+    }
+
+    // ========================== UNCLAIMABLE ==========================
+
+    /**
+     * @inheritdoc IMigratorV2V3
+     * @dev Permissionless pull. Deliberately uses reverting `safeTransfer` — this is
+     *      a user-initiated path, so reverting while the caller is still blocked is
+     *      correct (non-reverting behaviour is scoped to the batch path only). The
+     *      entry is zeroed BEFORE the transfer (checks-effects-interactions).
+     */
+    function claimUnclaimable(address token) external nonReentrant {
+        uint256 amount = unclaimable[token][msg.sender];
+        require(amount > 0, "Nothing to claim");
+        unclaimable[token][msg.sender] = 0;
+        IERC20(token).safeTransfer(msg.sender, amount);
+        emit UnclaimableClaimed(token, msg.sender, amount);
     }
 
     // ========================== ESCAPE HATCH ==========================
@@ -218,14 +245,48 @@ contract MigratorV2V3 is Ownable, ReentrancyGuard, IMigratorV2V3 {
         uint256 phUSDBal = phUSD.balanceOf(address(this));
         uint256 rewardBal = rewardToken.balanceOf(address(this));
 
+        // Live promo slot, mirroring migrate. address(0) = no active promotion, so
+        // there is no promo leg to sweep.
+        IERC20 promoToken = phlimboV3.promoToken();
+        uint256 promoBal =
+            address(promoToken) != address(0) ? promoToken.balanceOf(address(this)) : 0;
+
         if (phUSDBal > 0) {
             IERC20(address(phUSD)).safeTransfer(ownerAddr, phUSDBal);
         }
         if (rewardBal > 0) {
             rewardToken.safeTransfer(ownerAddr, rewardBal);
         }
+        if (promoBal > 0) {
+            promoToken.safeTransfer(ownerAddr, promoBal);
+        }
 
-        emit WithdrawnAll(ownerAddr, phUSDBal, rewardBal);
+        emit WithdrawnAll(ownerAddr, phUSDBal, rewardBal, promoBal);
+    }
+
+    // ========================== INTERNAL ==========================
+
+    /**
+     * @notice Non-reverting ERC20 transfer used by the migration pass: a single
+     *         blocklisted or otherwise reverting recipient must not brick migrate.
+     * @return success True if the transfer succeeded (call succeeded and returned
+     *         either nothing or true).
+     */
+    function _tryTransfer(IERC20 token, address to, uint256 amount) internal returns (bool success) {
+        (bool callSuccess, bytes memory returndata) = address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        return callSuccess && (returndata.length == 0 || abi.decode(returndata, (bool)));
+    }
+
+    /**
+     * @notice Forwards a reward delta to a user without ever reverting. On transfer
+     *         failure the amount is banked into `unclaimable` for a later
+     *         `claimUnclaimable` pull and `RewardForwardFailed` is emitted.
+     */
+    function _forward(IERC20 token, address user, uint256 amount) internal {
+        if (amount == 0) return;
+        if (_tryTransfer(token, user, amount)) return;
+        unclaimable[address(token)][user] += amount;
+        emit RewardForwardFailed(address(token), user, amount);
     }
 
     // ========================== VIEW ==========================

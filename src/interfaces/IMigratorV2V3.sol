@@ -47,12 +47,33 @@ interface IMigratorV2V3 {
     event MigrateProgress(int256 iterator, uint256 userCount);
 
     /**
+     * @notice Emitted when a reward transfer to a user fails during migrate and the
+     *         amount is banked into `unclaimable` instead (the pass continues)
+     * @param token The reward token whose transfer failed.
+     * @param user Recipient whose transfer failed.
+     * @param amount Amount banked.
+     */
+    event RewardForwardFailed(address indexed token, address indexed user, uint256 amount);
+
+    /**
+     * @notice Emitted when a user pulls a banked reward via claimUnclaimable.
+     * @param token The reward token claimed.
+     * @param user The claiming user.
+     * @param amount Amount transferred.
+     */
+    event UnclaimableClaimed(address indexed token, address indexed user, uint256 amount);
+
+    /**
      * @notice Emitted when withdrawAll sweeps stranded balances to the owner.
      * @param owner Owner that received the balances.
      * @param phUSDAmount Amount of phUSD transferred (may be 0).
      * @param rewardAmount Amount of reward token transferred (may be 0).
+     * @param promoAmount Amount of the live promo token transferred (0 when no
+     *        promotion is active or nothing is held).
      */
-    event WithdrawnAll(address indexed owner, uint256 phUSDAmount, uint256 rewardAmount);
+    event WithdrawnAll(
+        address indexed owner, uint256 phUSDAmount, uint256 rewardAmount, uint256 promoAmount
+    );
 
     // ========================== FUNCTIONS ==========================
 
@@ -76,11 +97,29 @@ interface IMigratorV2V3 {
     function migrate(uint256 maxIterations) external;
 
     /**
-     * @notice Owner-only recovery sweep. Drains any stranded phUSD and reward-token
-     *         balance to the owner. Does not touch the seeded list or iterator —
-     *         with live reads there are no balance preconditions to break.
+     * @notice Permissionless pull of a reward amount that could not be forwarded to
+     *         msg.sender during migrate (e.g. while blocklisted). Zeroes the entry,
+     *         then transfers with reverting semantics — a caller who still cannot
+     *         receive the token reverts and keeps their claim.
+     * @param token The reward token to claim banked amounts of.
+     */
+    function claimUnclaimable(address token) external;
+
+    /**
+     * @notice Owner-only LAST-DITCH recovery sweep. Drains the contract's ENTIRE
+     *         phUSD, reward-token and (live) promo-token balances to the owner —
+     *         including amounts banked in `unclaimable`, whose claims become
+     *         unbacked (reimbursement is then an out-of-band owner obligation).
+     *         Does not touch the seeded list or iterator — with live reads there
+     *         are no balance preconditions to break.
      */
     function withdrawAll() external;
+
+    /**
+     * @notice Reward amount banked for `user` in `token` after a failed forward
+     *         during migrate; claimable via claimUnclaimable.
+     */
+    function unclaimable(address token, address user) external view returns (uint256);
 
     /**
      * @notice Returns the number of users in the currently seeded list.
