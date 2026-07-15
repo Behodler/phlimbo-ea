@@ -110,17 +110,30 @@ interface IPhlimboV3 {
 
     /**
      * @notice Emitted when a promo transfer to a user fails during the flush and the
-     *         amount is banked into `unclaimablePromo` instead (flush continues)
+     *         amount is banked per-user into `unclaimablePromoOf[token][user]`
+     *         instead (flush continues); recoverable via `claimUnclaimablePromo`
+     * @param token Promo token whose transfer failed (needed to attribute banked
+     *        amounts from logs alone under rotation)
      * @param user Recipient whose transfer failed
      * @param amount Amount banked
      */
-    event PromoClaimFailed(address indexed user, uint256 amount);
+    event PromoClaimFailed(address indexed token, address indexed user, uint256 amount);
+
+    /**
+     * @notice Emitted when a user pulls a banked promo amount via claimUnclaimablePromo
+     * @param token Promo token (live or retired) that was pulled
+     * @param user User who pulled their banked amount
+     * @param amount Amount paid out
+     */
+    event UnclaimablePromoClaimed(address indexed token, address indexed user, uint256 amount);
 
     /**
      * @notice Emitted when a promotion is finalized and the slot cleared
      * @param token The promo token that was retired
      * @param leftoverRecipient Recipient of the leftover sweep
-     * @param leftoverAmount Amount swept (undistributed remainder + rounding dust + unclaimablePromo)
+     * @param leftoverAmount Amount swept (undistributed remainder + rounding dust +
+     *        pauseWithdraw forfeits; banked amounts in `totalUnclaimableOf` are
+     *        reserved and NOT swept)
      */
     event PromotionFinalized(address indexed token, address indexed leftoverRecipient, uint256 leftoverAmount);
 
@@ -160,16 +173,19 @@ interface IPhlimboV3 {
      *         staker's pending promo TO THE STAKER DIRECTLY and aligns their promoDebt
      *         to the current accumulator. Permissionless — recipients and amounts are
      *         fixed by state. Requires phase Flushing. Failed transfers are banked
-     *         into `unclaimablePromo` (flush continues).
+     *         per-user into `unclaimablePromoOf[token][user]` (flush continues);
+     *         recoverable via `claimUnclaimablePromo`.
      */
     function batchClaim(uint256 maxIterations) external;
 
     /**
      * @notice Finalizes the rotation: requires the flush cursor to have covered the
-     *         entire staker set. Sweeps the remaining promo token balance (leftover +
-     *         rounding dust + unclaimablePromo) to `leftoverRecipient` and clears the
-     *         slot (promoToken/rate/balance zeroed; accPromoPerShare NEVER reset).
-     *         Phase Flushing → None. Owner only.
+     *         entire staker set. Sweeps only the unencumbered promo token balance
+     *         (leftover + rounding dust + pauseWithdraw forfeits) to
+     *         `leftoverRecipient` — banked amounts (`totalUnclaimableOf`) are
+     *         reserved, saturating at zero, and survive the rotation — then clears
+     *         the slot (promoToken/rate/balance zeroed; accPromoPerShare NEVER
+     *         reset). Phase Flushing → None. Owner only.
      */
     function finalizePromotion(address leftoverRecipient) external;
 
@@ -179,24 +195,40 @@ interface IPhlimboV3 {
      */
     function abortFlush() external;
 
+    /**
+     * @notice Pulls the caller's banked promo for `token` — the amount recorded when
+     *         a flush transfer to them failed (audit-08 M-01). Permissionless;
+     *         deliberately not pause-gated so a user can self-rescue mid-flush.
+     *         Reverts with "Nothing to claim" when the caller has no bank, and
+     *         reverts (reverting safeTransfer) while the caller is still blocked.
+     * @param token The promo token (live or retired) whose bank is being pulled
+     */
+    function claimUnclaimablePromo(address token) external;
+
     // ========================== PROMO VIEWS ==========================
 
     /**
      * @notice Returns pending promo rewards for a user
+     * @dev Returns 0 for users whose flush transfer failed and was banked — by
+     *      design (audit-08 M-01): banked recovery is surfaced via
+     *      `unclaimablePromoOf` / `totalUnclaimableOf`, never here.
      */
     function pendingPromo(address user) external view returns (uint256);
 
     /**
      * @notice Returns current promotional slot information
      */
-    function getPromoInfo() external view returns (
-        address _promoToken,
-        uint256 _promoRewardBalance,
-        uint256 _promoRewardPerSecond,
-        uint256 _promoDepletionDuration,
-        PromoPhase _promoPhase,
-        uint256 _flushCursor
-    );
+    function getPromoInfo()
+        external
+        view
+        returns (
+            address _promoToken,
+            uint256 _promoRewardBalance,
+            uint256 _promoRewardPerSecond,
+            uint256 _promoDepletionDuration,
+            PromoPhase _promoPhase,
+            uint256 _flushCursor
+        );
 
     // ========================== ADMIN FUNCTIONS ==========================
 
@@ -232,6 +264,10 @@ interface IPhlimboV3 {
 
     /**
      * @notice Emergency function to transfer all tokens to a recipient
+     * @dev Sweeps the LIVE promo token's entire balance including any per-user
+     *      banked amounts (`unclaimablePromoOf`) — accepted escape-hatch trade-off
+     *      (audit-08 M-01); note the asymmetry with `finalizePromotion`, which
+     *      must NOT sweep the bank.
      * @param recipient Address to receive the tokens
      */
     function emergencyTransfer(address recipient) external;
@@ -301,13 +337,16 @@ interface IPhlimboV3 {
     /**
      * @notice Returns current pool information
      */
-    function getPoolInfo() external view returns (
-        uint256 _totalStaked,
-        uint256 _accPhUSDPerShare,
-        uint256 _accStablePerShare,
-        uint256 _phUSDPerSecond,
-        uint256 _lastRewardTime
-    );
+    function getPoolInfo()
+        external
+        view
+        returns (
+            uint256 _totalStaked,
+            uint256 _accPhUSDPerShare,
+            uint256 _accStablePerShare,
+            uint256 _phUSDPerSecond,
+            uint256 _lastRewardTime
+        );
 
     // ========================== STATE VARIABLE GETTERS ==========================
 
@@ -338,7 +377,12 @@ interface IPhlimboV3 {
     function accPromoPerShare() external view returns (uint256);
     function promoPhase() external view returns (PromoPhase);
     function flushCursor() external view returns (uint256);
-    function unclaimablePromo() external view returns (uint256);
+    /// @notice token => user => promo banked when a flush transfer failed;
+    ///         pulled via `claimUnclaimablePromo` (audit-08 M-01)
+    function unclaimablePromoOf(address token, address user) external view returns (uint256);
+    /// @notice token => total promo still banked and unclaimed across all users;
+    ///         reserved from the `finalizePromotion` sweep (audit-08 M-01)
+    function totalUnclaimableOf(address token) external view returns (uint256);
 
     // ========================== STAKER ENUMERATION ==========================
 

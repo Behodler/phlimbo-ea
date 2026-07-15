@@ -138,9 +138,19 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     /// @notice Monotone cursor into `_stakers` during a flush (chunked-iterator idiom)
     uint256 public flushCursor;
 
-    /// @notice Promo tokens whose transfer to a user failed during flush (banked
-    ///         for out-of-band handling; swept at finalizePromotion)
-    uint256 public unclaimablePromo;
+    /// @notice token => user => promo amount banked when a flush transfer to that
+    ///         user failed (audit-08 M-01). Pulled permissionlessly via
+    ///         `claimUnclaimablePromo`; reserved from the `finalizePromotion` sweep.
+    ///         Keyed by token because the promo slot rotates — a retired token's
+    ///         bank survives into later promotions.
+    mapping(address => mapping(address => uint256)) public unclaimablePromoOf;
+
+    /// @notice token => total promo still banked and unclaimed across all users.
+    ///         Incremented alongside `unclaimablePromoOf` in `batchClaim`,
+    ///         decremented by exactly the pulled amount in `claimUnclaimablePromo`
+    ///         (never zeroed wholesale — it spans all users), and reserved from the
+    ///         `finalizePromotion` sweep so banked entitlements are never swept.
+    mapping(address => uint256) public totalUnclaimableOf;
 
     // ========================== CONSTANTS ==========================
 
@@ -302,6 +312,15 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     /**
      * @notice Emergency function to transfer all tokens to a recipient
      * @dev V3: also sweeps the promo token when a promotion slot is set.
+     *
+     *      Trade-off (audit-08 M-01): this sweeps the LIVE promo token's entire
+     *      balance, INCLUDING any per-user banked amounts (`unclaimablePromoOf`) —
+     *      an accepted escape-hatch trade-off mirroring `MigratorV2V3.withdrawAll`;
+     *      making users whole after such a sweep is an out-of-band owner
+     *      obligation. Note the asymmetry with `finalizePromotion`, which is a
+     *      routine lifecycle step and must NOT sweep the bank. A RETIRED token's
+     *      bank (promoToken == address(0) for it) is unreachable here and stays
+     *      pullable via `claimUnclaimablePromo`.
      */
     function emergencyTransfer(address recipient) external onlyOwner {
         uint256 phUSDBalance = phUSD.balanceOf(address(this));
@@ -424,8 +443,9 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
      *         their promoDebt to the current accumulator.
      * @dev Permissionless: recipients and amounts are fixed by state, so anyone may
      *      help complete a flush. Failed transfers (e.g. blocklisted recipients) are
-     *      banked into `unclaimablePromo` — the flush must never brick. Touches ONLY
-     *      promo state; stable/phUSD pendings are untouched.
+     *      banked per-user into `unclaimablePromoOf[token][staker]` (audit-08 M-01)
+     *      for later pull via `claimUnclaimablePromo` — the flush must never brick.
+     *      Touches ONLY promo state; stable/phUSD pendings are untouched.
      */
     function batchClaim(uint256 maxIterations) external nonReentrant {
         require(promoPhase == PromoPhase.Flushing, "Promo phase must be Flushing");
@@ -451,8 +471,14 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
                 if (_tryTransfer(promoToken, staker, pending)) {
                     emit PromoClaimed(staker, pending);
                 } else {
-                    unclaimablePromo += pending;
-                    emit PromoClaimFailed(staker, pending);
+                    // Per-user bank (audit-08 M-01): the debt is already aligned
+                    // above, so without this record the entitlement would be erased
+                    // (pendingPromo reads 0 forever). Banked amounts are reserved
+                    // from the finalizePromotion sweep and recovered via the
+                    // permissionless claimUnclaimablePromo pull.
+                    unclaimablePromoOf[address(promoToken)][staker] += pending;
+                    totalUnclaimableOf[address(promoToken)] += pending;
+                    emit PromoClaimFailed(address(promoToken), staker, pending);
                 }
             }
         }
@@ -463,12 +489,24 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
     /**
      * @notice Finalizes the rotation: requires full cursor coverage of the frozen
-     *         staker set. Sweeps the remaining promo token balance (undistributed
-     *         remainder, rounding dust, and unclaimablePromo) to `leftoverRecipient`.
+     *         staker set. Sweeps only the UNENCUMBERED promo token balance
+     *         (undistributed remainder + rounding dust + pauseWithdraw forfeits) to
+     *         `leftoverRecipient`; per-user banked amounts (`totalUnclaimableOf`)
+     *         are reserved and survive the rotation (audit-08 M-01).
      *         Phase Flushing → None; owner then unpauses.
      * @dev `accPromoPerShare` is deliberately NOT reset (§2.1): all debts were aligned
      *      to it by the flush, so pending against the next token starts at exactly
      *      zero. Zeroing it while debts are non-zero would underflow amount*acc − debt.
+     *
+     *      Forfeit-sweep vs bank-retain (audit-08 M-01): `pauseWithdraw` forfeits
+     *      realign the debt with NOTHING banked — those tokens are legitimately
+     *      swept here as leftover. Failed flush transfers, by contrast, are banked
+     *      per-user in `batchClaim` and reserved from this sweep via
+     *      `totalUnclaimableOf`; they belong to users, not to `leftoverRecipient`.
+     *
+     *      The subtraction saturates deliberately: even under accounting drift this
+     *      function must never revert — stranding some leftover is preferable to
+     *      pinning the contract in `Flushing` forever.
      */
     function finalizePromotion(address leftoverRecipient) external onlyOwner {
         require(promoPhase == PromoPhase.Flushing, "Promo phase must be Flushing");
@@ -476,7 +514,9 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         require(leftoverRecipient != address(0), "Invalid recipient");
 
         IERC20 retiredToken = promoToken;
-        uint256 leftover = retiredToken.balanceOf(address(this));
+        uint256 banked = totalUnclaimableOf[address(retiredToken)];
+        uint256 balance = retiredToken.balanceOf(address(this));
+        uint256 leftover = balance > banked ? balance - banked : 0;
         if (leftover > 0) {
             retiredToken.safeTransfer(leftoverRecipient, leftover);
         }
@@ -484,7 +524,8 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         promoToken = IERC20(address(0));
         promoRewardPerSecond = 0;
         promoRewardBalance = 0;
-        unclaimablePromo = 0;
+        // NOTE: totalUnclaimableOf / unclaimablePromoOf are deliberately NOT cleared
+        // — the bank survives the rotation and remains pullable (audit-08 M-01).
         promoPhase = PromoPhase.None;
 
         emit PromotionFinalized(address(retiredToken), leftoverRecipient, leftover);
@@ -498,6 +539,32 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     function abortFlush() external onlyOwner {
         require(promoPhase == PromoPhase.Flushing, "Promo phase must be Flushing");
         promoPhase = PromoPhase.Active;
+    }
+
+    // ========================== PROMO BANK (PERMISSIONLESS PULL) ==========================
+
+    /**
+     * @notice Pulls the caller's banked promo for `token` — the amount recorded when
+     *         a flush transfer to them failed (audit-08 M-01). Permissionless and
+     *         callable at any time, including for tokens retired by rotation.
+     * @dev Deliberately NOT `whenNotPaused`: `beginFlush` pauses the contract, so a
+     *      gate would lock a blocked-then-unblocked staker out of self-rescue for
+     *      the whole flush window. Matches `MigratorV2V3.claimUnclaimable` and the
+     *      deliberately-ungated `batchClaim`. Uses a reverting `safeTransfer` (not
+     *      `_tryTransfer`): a user-initiated pull that fails while the caller is
+     *      still blocked SHOULD revert, leaving the bank intact. Both state writes
+     *      precede the transfer (checks-effects-interactions); `totalUnclaimableOf`
+     *      is decremented by exactly `amount` — it spans all users, so it must never
+     *      be zeroed on a single user's claim.
+     * @param token The promo token (live or retired) whose bank is being pulled
+     */
+    function claimUnclaimablePromo(address token) external nonReentrant {
+        uint256 amount = unclaimablePromoOf[token][msg.sender];
+        require(amount > 0, "Nothing to claim");
+        unclaimablePromoOf[token][msg.sender] = 0;
+        totalUnclaimableOf[token] -= amount;
+        IERC20(token).safeTransfer(msg.sender, amount);
+        emit UnclaimablePromoClaimed(token, msg.sender, amount);
     }
 
     // ========================== PAUSE MECHANISM ==========================
@@ -873,6 +940,11 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
     /**
      * @notice Returns pending promo rewards for a user
+     * @dev Returns 0 for users whose flush transfer failed and was banked — BY
+     *      DESIGN (audit-08 M-01): `batchClaim` aligns `promoDebt` unconditionally
+     *      (§2.1 cross-promotion non-contamination requires it), so banked recovery
+     *      is surfaced via `unclaimablePromoOf` / `totalUnclaimableOf`, never here.
+     *      Do NOT "fix" this by un-aligning the debt.
      */
     function pendingPromo(address user) external view returns (uint256) {
         UserInfo storage userDetails = userInfo[user];

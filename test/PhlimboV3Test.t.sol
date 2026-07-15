@@ -33,7 +33,8 @@ contract PhlimboV3Test is Test {
     event PromoDepletionDurationUpdated(uint256 oldDuration, uint256 newDuration);
     event PromoClaimed(address indexed user, uint256 amount);
     event FlushProgress(uint256 cursor, uint256 total);
-    event PromoClaimFailed(address indexed user, uint256 amount);
+    event PromoClaimFailed(address indexed token, address indexed user, uint256 amount);
+    event UnclaimablePromoClaimed(address indexed token, address indexed user, uint256 amount);
     event PromotionFinalized(address indexed token, address indexed leftoverRecipient, uint256 leftoverAmount);
 
     PhlimboV3 public phlimbo;
@@ -59,11 +60,7 @@ contract PhlimboV3Test is Test {
         phUSD = new MockFlax();
         rewardToken = new MockStable();
 
-        phlimbo = new PhlimboV3(
-            address(phUSD),
-            address(rewardToken),
-            DEPLETION_DURATION
-        );
+        phlimbo = new PhlimboV3(address(phUSD), address(rewardToken), DEPLETION_DURATION);
 
         phUSD.setMinter(address(phlimbo), true);
 
@@ -1335,11 +1332,7 @@ contract PhlimboV3Test is Test {
 
         vm.prank(alice);
         phlimbo.withdraw(STAKE_AMOUNT, alice);
-        assertEq(
-            partner.balanceOf(alice),
-            pendingAtStake + pendingAtWithdraw,
-            "withdraw auto-claims promo"
-        );
+        assertEq(partner.balanceOf(alice), pendingAtStake + pendingAtWithdraw, "withdraw auto-claims promo");
         assertEq(phlimbo.pendingPromo(alice), 0);
     }
 
@@ -1666,24 +1659,28 @@ contract PhlimboV3Test is Test {
 
         phlimbo.beginFlush();
 
-        vm.expectEmit(true, false, false, true);
-        emit PromoClaimFailed(alice, alicePending);
+        vm.expectEmit(true, true, false, true);
+        emit PromoClaimFailed(address(blk), alice, alicePending);
         phlimbo.batchClaim(10);
 
         assertEq(phlimbo.flushCursor(), 2, "flush continued past failure");
         assertEq(blk.balanceOf(alice), 0, "blocked transfer did not pay");
         assertEq(blk.balanceOf(bob), bobPending, "bob still paid");
-        assertEq(phlimbo.unclaimablePromo(), alicePending, "failed amount banked");
+        assertEq(phlimbo.unclaimablePromoOf(address(blk), alice), alicePending, "failed amount banked per-user");
+        assertEq(phlimbo.totalUnclaimableOf(address(blk)), alicePending, "aggregate tracks the bank");
+        // Debt stays aligned (§2.1) — the entitlement survives in the bank, NOT in pendingPromo.
         assertEq(phlimbo.pendingPromo(alice), 0, "debt still aligned on failure");
 
-        // Sweep includes the banked amount; slot + banked counter cleared
+        // Sweep reserves the banked amount; the bank survives the rotation
         address recipient = address(0x99);
         uint256 contractBalance = blk.balanceOf(address(phlimbo));
         assertGe(contractBalance, alicePending, "banked tokens still in contract");
 
         phlimbo.finalizePromotion(recipient);
-        assertEq(blk.balanceOf(recipient), contractBalance, "leftover + unclaimable swept");
-        assertEq(phlimbo.unclaimablePromo(), 0, "unclaimablePromo cleared");
+        assertEq(blk.balanceOf(recipient), contractBalance - alicePending, "only unencumbered balance swept");
+        assertEq(blk.balanceOf(address(phlimbo)), alicePending, "banked tokens retained");
+        assertEq(phlimbo.unclaimablePromoOf(address(blk), alice), alicePending, "per-user bank survives rotation");
+        assertEq(phlimbo.totalUnclaimableOf(address(blk)), alicePending, "aggregate survives rotation");
     }
 
     // ============================================================
@@ -1709,6 +1706,7 @@ contract PhlimboV3Test is Test {
 
         assertEq(partner.balanceOf(recipient), leftover, "leftover swept");
         assertEq(partner.balanceOf(address(phlimbo)), 0);
+        assertEq(phlimbo.totalUnclaimableOf(address(partner)), 0, "no failures: nothing reserved from sweep");
 
         // Slot cleared…
         assertEq(address(phlimbo.promoToken()), address(0));

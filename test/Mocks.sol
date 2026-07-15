@@ -97,7 +97,8 @@ contract MockFeeToken is ERC20 {
  * @title MockBlocklistToken
  * @notice ERC20 with a USDT-style recipient blocklist. Transfers to a blocked
  *         address revert — used to verify the non-reverting transfer paths:
- *         PhlimboV3 batchClaim banking failed amounts into unclaimablePromo, and
+ *         PhlimboV3 batchClaim banking failed amounts into the per-user
+ *         unclaimablePromoOf mapping (plus the claimUnclaimablePromo pull), and
  *         MigratorV2V3 migrate banking failed reward forwards into the per-user
  *         `unclaimable` mapping (plus the claimUnclaimable pull path).
  */
@@ -129,9 +130,9 @@ contract MockPhlimboHook is IPhlimboHook {
         string kind; // "deposit" | "withdraw" | "claim"
         address caller;
         address user;
-        uint256 amount;        // stake amount or withdraw amount; 0 for claim
-        uint256 phUSDAmount;   // claim only
-        uint256 stableAmount;  // claim only
+        uint256 amount; // stake amount or withdraw amount; 0 for claim
+        uint256 phUSDAmount; // claim only
+        uint256 stableAmount; // claim only
     }
 
     Call[] public calls;
