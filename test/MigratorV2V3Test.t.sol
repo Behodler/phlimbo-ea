@@ -34,6 +34,21 @@ import "./Mocks.sol";
  *  14. withdrawAll promo sweep + full sweep of banked `unclaimable` amounts
  *      (last-ditch trade-off: subsequent claims are unbacked)
  *  15. Audit M-01 scenario regression: frozen middle user no longer bricks the pass
+ *
+ * Story 026 (audit-08 M-02) makes the entire per-user body unbrickable via a
+ * try/catch'd `migrateOne` self-call, a widened dust skip, and `skipCurrent`:
+ *
+ *  16. Vector 1a regression: sub-MINIMUM_STAKE dust position (real V2
+ *      pauseWithdraw path) is skipped, emits UserMigrationSkipped, pass completes
+ *  17. Vector 1b regression: stale-debt V2 position (pauseWithdraw without debt
+ *      realignment → Panic 0x11 in V2._claimRewards) is skipped via try/catch
+ *  18. Clean-pass guard: every user actually lands in V3 (pins the
+ *      nonReentrant-on-migrateOne silent-no-op failure mode)
+ *  19. migrateOne self-call gate ("Only self" for any external caller)
+ *  20. skipCurrent: advances past a bad index, completion semantics on the final
+ *      index, "Nothing to skip" negatives, onlyOwner
+ *  21. MINIMUM_STAKE boundary: a position exactly at the minimum migrates (skip
+ *      is strictly `<`)
  */
 contract MigratorV2V3Test is Test {
     // Re-declare events for expectEmit
@@ -47,6 +62,7 @@ contract MigratorV2V3Test is Test {
     );
     event MigrateProgress(int256 iterator, uint256 userCount);
     event RewardForwardFailed(address indexed token, address indexed user, uint256 amount);
+    event UserMigrationSkipped(address indexed user, uint256 amount);
     event UnclaimableClaimed(address indexed token, address indexed user, uint256 amount);
     event WithdrawnAll(
         address indexed owner, uint256 phUSDAmount, uint256 rewardAmount, uint256 promoAmount
@@ -290,7 +306,11 @@ contract MigratorV2V3Test is Test {
         migrator.migrate(1);
     }
 
-    function test_migrate_reverts_when_v3_migrator_not_wired() public {
+    /// @dev Post story-026 (audit-08 M-02): a missing V3 wiring no longer reverts
+    ///      the pass — the migrateOne try/catch skips the user (with
+    ///      UserMigrationSkipped) and the pass completes. The V2 position is
+    ///      untouched, so nothing is lost; the owner must read the skip events.
+    function test_migrate_v3_migrator_not_wired_skips_user_and_completes() public {
         PhlimboV2 freshV2 = new PhlimboV2(address(phUSD), address(stable), DEPLETION_DURATION);
         PhlimboV3 freshV3 = new PhlimboV3(address(phUSD), address(stable), DEPLETION_DURATION);
         MigratorV2V3 freshMigrator = new MigratorV2V3(
@@ -306,11 +326,20 @@ contract MigratorV2V3Test is Test {
         vm.stopPrank();
 
         freshMigrator.seedUsers(_oneUser(alice));
-        vm.expectRevert("Not authorized");
+        vm.expectEmit(true, false, false, true);
+        emit UserMigrationSkipped(alice, 100 ether);
         freshMigrator.migrate(1);
+
+        assertEq(freshMigrator.migrateIterator(), int256(-1), "pass completed");
+        (uint256 aliceV2,,) = freshV2.userInfo(alice);
+        assertEq(aliceV2, 100 ether, "alice's V2 position untouched");
+        (uint256 aliceV3,,,) = freshV3.userInfo(alice);
+        assertEq(aliceV3, 0, "alice not migrated into V3");
     }
 
-    function test_migrate_reverts_when_v2_migrator_not_wired() public {
+    /// @dev Post story-026 (audit-08 M-02): mirrors the V3 case above — a missing
+    ///      V2 wiring is skipped rather than reverting the pass.
+    function test_migrate_v2_migrator_not_wired_skips_user_and_completes() public {
         PhlimboV2 freshV2 = new PhlimboV2(address(phUSD), address(stable), DEPLETION_DURATION);
         PhlimboV3 freshV3 = new PhlimboV3(address(phUSD), address(stable), DEPLETION_DURATION);
         MigratorV2V3 freshMigrator = new MigratorV2V3(
@@ -326,8 +355,15 @@ contract MigratorV2V3Test is Test {
         vm.stopPrank();
 
         freshMigrator.seedUsers(_oneUser(alice));
-        vm.expectRevert("Not authorized");
+        vm.expectEmit(true, false, false, true);
+        emit UserMigrationSkipped(alice, 100 ether);
         freshMigrator.migrate(1);
+
+        assertEq(freshMigrator.migrateIterator(), int256(-1), "pass completed");
+        (uint256 aliceV2,,) = freshV2.userInfo(alice);
+        assertEq(aliceV2, 100 ether, "alice's V2 position untouched");
+        (uint256 aliceV3,,,) = freshV3.userInfo(alice);
+        assertEq(aliceV3, 0, "alice not migrated into V3");
     }
 
     // ============================================================
@@ -909,5 +945,218 @@ contract MigratorV2V3Test is Test {
             0,
             "carol's stable rewards banked, not lost"
         );
+    }
+
+    // ============================================================
+    // 16-21. Unbrickable per-user body (story 026, audit-08 M-02)
+    // ============================================================
+
+    address public pauser = address(0x9A);
+
+    /// @dev Stakes alice / `middle` / carol at 1000 ether each and wires the pauser
+    ///      (ports the probe-08 PoC fixtures: the bad position sits mid-list).
+    function _stakeThreeAtThousand(address middle) internal returns (address[] memory list) {
+        phlimboV2.setPauser(pauser);
+        list = new address[](3);
+        list[0] = alice;
+        list[1] = middle;
+        list[2] = carol;
+        for (uint256 i = 0; i < 3; i++) {
+            _stakeInV2(list[i], 1000 ether);
+        }
+    }
+
+    /// @dev Vector 1a (probe-08-code3, LOCAL-102): V2.pauseWithdraw has no dust
+    ///      rule, so bob leaves a 1-wei position that V3.stake would reject
+    ///      ("Below minimum stake"). Pre-fix this bricked the pass at bob's index;
+    ///      now the widened dust skip passes over him and carol still migrates.
+    function test_migrate_dust_position_is_skipped_and_pass_completes() public {
+        address[] memory list = _stakeThreeAtThousand(bob);
+
+        vm.prank(pauser);
+        phlimboV2.pause();
+        vm.prank(bob);
+        phlimboV2.pauseWithdraw(1000 ether - 1);
+        vm.prank(pauser);
+        phlimboV2.unpause();
+
+        assertEq(_v2Amount(bob), 1, "bob left 1 wei of dust in V2");
+        assertLt(1, phlimboV3.MINIMUM_STAKE(), "dust is below V3 MINIMUM_STAKE");
+
+        migrator.seedUsers(list);
+
+        vm.expectEmit(true, false, false, true);
+        emit UserMigrationSkipped(bob, 1);
+        migrator.migrate(10);
+
+        assertEq(migrator.migrateIterator(), int256(-1), "pass completed");
+        assertEq(_v3Amount(alice), 1000 ether, "alice landed in V3");
+        assertEq(_v3Amount(carol), 1000 ether, "carol behind the dust landed in V3");
+        assertEq(_v2Amount(carol), 0, "carol out of V2");
+        assertEq(_v3Amount(bob), 0, "dust user not in V3");
+        assertEq(_v2Amount(bob), 1, "dust position left untouched in V2");
+    }
+
+    /// @dev Vector 1b (probe-08-code4, LOCAL-101): pauseWithdraw reduces
+    ///      user.amount without realigning phUSDDebt/stableDebt, so
+    ///      V2._claimRewards underflows (Panic 0x11) and V2.withdraw reverts for
+    ///      that user. The position is well above MINIMUM_STAKE — only the
+    ///      migrateOne try/catch saves the pass.
+    function test_migrate_stale_debt_position_is_skipped_and_pass_completes() public {
+        address bricked = dave;
+        address[] memory list = _stakeThreeAtThousand(bricked);
+        _fundV2StableRewards();
+
+        vm.warp(block.timestamp + 30 days);
+
+        // Materialise a non-zero debt (debt is only written on stake/withdraw/claim).
+        vm.prank(bricked);
+        phlimboV2.claim(bricked);
+
+        // Pause; bricked emergency-exits HALF — amount halves, debt is untouched.
+        vm.prank(pauser);
+        phlimboV2.pause();
+        vm.prank(bricked);
+        phlimboV2.pauseWithdraw(500 ether);
+        vm.prank(pauser);
+        phlimboV2.unpause();
+
+        // Short window: underflow needs acc_now < 2*acc_then.
+        vm.warp(block.timestamp + 1 hours);
+
+        assertEq(_v2Amount(bricked), 500 ether, "well above MINIMUM_STAKE, not the dust vector");
+
+        // Pin that the vector is live: the migrator's V2.withdraw leg panics 0x11.
+        vm.prank(address(migrator));
+        vm.expectRevert(stdError.arithmeticError);
+        phlimboV2.withdraw(500 ether, bricked);
+
+        migrator.seedUsers(list);
+
+        vm.expectEmit(true, false, false, true);
+        emit UserMigrationSkipped(bricked, 500 ether);
+        migrator.migrate(10);
+
+        assertEq(migrator.migrateIterator(), int256(-1), "pass completed");
+        assertEq(_v3Amount(alice), 1000 ether, "alice landed in V3");
+        assertEq(_v3Amount(carol), 1000 ether, "carol behind the bad index landed in V3");
+        assertEq(_v3Amount(bricked), 0, "bricked user not in V3");
+        assertEq(_v2Amount(bricked), 500 ether, "bricked position left untouched in V2");
+    }
+
+    /// @dev Guard against the silent-no-op failure mode: if migrateOne carried
+    ///      nonReentrant (OZ v5's single shared lock), the self-call would revert,
+    ///      the catch would swallow it, and a "completed" pass would migrate
+    ///      NOBODY. A clean pass must land every position in V3.
+    function test_migrate_clean_pass_lands_every_user_in_v3() public {
+        _stakeFiveInV2();
+        address[] memory u = _fiveUsers();
+        migrator.seedUsers(u);
+
+        migrator.migrate(10);
+
+        assertEq(migrator.migrateIterator(), int256(-1), "pass completed");
+        for (uint256 i = 0; i < 5; i++) {
+            assertEq(_v3Amount(u[i]), depositFixtures[i], "user actually landed in V3");
+            assertEq(_v2Amount(u[i]), 0, "user actually left V2");
+        }
+        assertEq(
+            phlimboV3.totalStaked(),
+            depositFixtures[0] + depositFixtures[1] + depositFixtures[2]
+                + depositFixtures[3] + depositFixtures[4],
+            "V3 holds every principal; the pass was not a silent no-op"
+        );
+    }
+
+    function test_migrateOne_external_caller_reverts() public {
+        _stakeInV2(alice, 100 ether);
+
+        vm.prank(alice);
+        vm.expectRevert("Only self");
+        migrator.migrateOne(alice, 100 ether);
+
+        // Even the owner is not "self".
+        vm.expectRevert("Only self");
+        migrator.migrateOne(alice, 100 ether);
+    }
+
+    function test_skipCurrent_advances_cursor_past_bad_index_and_migrate_resumes() public {
+        _stakeFiveInV2();
+        migrator.seedUsers(_fiveUsers());
+        migrator.migrate(2);
+        assertEq(migrator.migrateIterator(), int256(2), "cursor at carol");
+
+        vm.expectEmit(true, false, false, true);
+        emit UserMigrationSkipped(carol, 0);
+        vm.expectEmit(false, false, false, true);
+        emit MigrateProgress(int256(3), 5);
+        migrator.skipCurrent();
+
+        assertEq(migrator.migrateIterator(), int256(3), "cursor stepped past carol");
+
+        // A following migrate resumes from dave and completes the pass.
+        migrator.migrate(10);
+        assertEq(migrator.migrateIterator(), int256(-1), "pass completed");
+        assertEq(_v3Amount(carol), 0, "skipped carol not in V3");
+        assertEq(_v2Amount(carol), depositFixtures[2], "carol's V2 position untouched");
+        assertEq(_v3Amount(dave), depositFixtures[3], "dave migrated after the skip");
+        assertEq(_v3Amount(eve), depositFixtures[4], "eve migrated after the skip");
+    }
+
+    function test_skipCurrent_on_final_index_completes_pass() public {
+        _stakeFiveInV2();
+        migrator.seedUsers(_fiveUsers());
+        migrator.migrate(4);
+        assertEq(migrator.migrateIterator(), int256(4), "cursor at the final index");
+
+        vm.expectEmit(true, false, false, true);
+        emit UserMigrationSkipped(eve, 0);
+        vm.expectEmit(false, false, false, true);
+        emit MigrateProgress(int256(-1), 5);
+        migrator.skipCurrent();
+
+        assertEq(migrator.migrateIterator(), int256(-1), "skip consumed the final index");
+        vm.expectRevert("Migration complete");
+        migrator.migrate(1);
+    }
+
+    function test_skipCurrent_nothing_to_skip_reverts() public {
+        // Unseeded.
+        vm.expectRevert("Nothing to skip");
+        migrator.skipCurrent();
+
+        // Pass complete (migrateIterator == -1).
+        _stakeInV2(alice, 100 ether);
+        migrator.seedUsers(_oneUser(alice));
+        migrator.migrate(10);
+        assertEq(migrator.migrateIterator(), int256(-1));
+        vm.expectRevert("Nothing to skip");
+        migrator.skipCurrent();
+    }
+
+    function test_skipCurrent_non_owner_reverts() public {
+        _stakeInV2(alice, 100 ether);
+        migrator.seedUsers(_oneUser(alice));
+
+        vm.prank(alice);
+        vm.expectRevert();
+        migrator.skipCurrent();
+    }
+
+    /// @dev Boundary: the dust skip is strictly `<` — a position exactly at
+    ///      MINIMUM_STAKE migrates normally.
+    function test_migrate_position_exactly_at_minimum_stake_migrates() public {
+        uint256 minStake = phlimboV3.MINIMUM_STAKE();
+        _stakeInV2(alice, minStake);
+
+        migrator.seedUsers(_oneUser(alice));
+
+        vm.expectEmit(true, false, false, true);
+        emit UserMigrated(alice, minStake, 0, 0, 0);
+        migrator.migrate(1);
+
+        assertEq(migrator.migrateIterator(), int256(-1), "pass completed");
+        assertEq(_v3Amount(alice), minStake, "exact-minimum position landed in V3");
+        assertEq(_v2Amount(alice), 0, "position left V2");
     }
 }
