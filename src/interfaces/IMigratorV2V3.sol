@@ -65,8 +65,14 @@ interface IMigratorV2V3 {
      *         these events.
      * @param user The user whose index was skipped.
      * @param amount The live V2 amount observed at skip time (0 for skipCurrent).
+     * @param reason Raw ABI-encoded revert data, decoded off-chain. INVARIANT:
+     *        empty (`reason.length == 0`) means the migration was skipped WITHOUT
+     *        being attempted (dust band or `skipCurrent`); non-empty means the
+     *        `migrateOne` self-call was attempted and reverted with this data
+     *        (standard encodings: `Error(string)` selector 0x08c379a0,
+     *        `Panic(uint256)` selector 0x4e487b71, or empty returndata reverts).
      */
-    event UserMigrationSkipped(address indexed user, uint256 amount);
+    event UserMigrationSkipped(address indexed user, uint256 amount, bytes reason);
 
     /**
      * @notice Emitted when a user pulls a banked reward via claimUnclaimable.

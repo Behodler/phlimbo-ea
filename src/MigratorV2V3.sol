@@ -58,11 +58,17 @@ import "./interfaces/IMigratorV2V3.sol";
  *         stake, reward forwarding) runs inside a try/catch'd `migrateOne`
  *         self-call, so a position that reverts anywhere in it — a stale-debt V2
  *         position that panics in `_claimRewards`, or anything unforeseen — is
- *         skipped atomically: `UserMigrationSkipped` is emitted, the user's V2
- *         position is left untouched for a later targeted pass (seeded from those
- *         events once this pass completes), and the cursor advances. Positions
- *         below V3's MINIMUM_STAKE (dust that `stake` would reject) are skipped
- *         up-front with the same event. The try/catch absorbs REVERTS, not gas
+ *         skipped atomically: `UserMigrationSkipped` is emitted carrying the raw
+ *         revert data as its `reason`, the user's V2 position is left untouched
+ *         for a later targeted pass (seeded from those events once this pass
+ *         completes), and the cursor advances. Positions below V3's MINIMUM_STAKE
+ *         (dust that `stake` would reject) are skipped up-front with the same
+ *         event and an EMPTY reason (nothing was attempted). BEWARE: a
+ *         misconfigured pass still COMPLETES — an unwired (missing setMigrator)
+ *         or paused Phlimbo surfaces as a pass full of skips whose reasons decode
+ *         to `Error(string)` (e.g. "Not authorized" / "Pausable: paused"); the
+ *         owner MUST read the UserMigrationSkipped events after every pass before
+ *         trusting it. The try/catch absorbs REVERTS, not gas
  *         exhaustion: under the 63/64 rule an out-of-gas `migrateOne` can starve
  *         the remainder of the pass — mitigated by calling `migrate` with a
  *         smaller `maxIterations`, and the owner-only `skipCurrent` is the
@@ -187,17 +193,21 @@ contract MigratorV2V3 is Ownable, ReentrancyGuard, IMigratorV2V3 {
             if (amount == 0) continue; // exited or already migrated
             if (amount < minStake) {
                 // Dust that phlimboV3.stake would reject ("Below minimum stake").
-                // The position stays in V2 and remains the user's.
-                emit UserMigrationSkipped(user, amount);
+                // The position stays in V2 and remains the user's. Empty reason:
+                // nothing was attempted.
+                emit UserMigrationSkipped(user, amount, "");
                 continue;
             }
 
             try this.migrateOne(user, amount) {
                 // UserMigrated emitted inside migrateOne.
-            } catch {
+            } catch (bytes memory reason) {
                 // The whole iteration reverted atomically (bracket included); the
                 // user's V2 position is untouched and the cursor still advances.
-                emit UserMigrationSkipped(user, amount);
+                // `reason` is the raw ABI-encoded revert data — decoded off-chain
+                // to tell a genuinely bad position apart from a misconfiguration
+                // (e.g. "Not authorized" = missing setMigrator wiring).
+                emit UserMigrationSkipped(user, amount, reason);
             }
         }
 
@@ -274,7 +284,7 @@ contract MigratorV2V3 is Ownable, ReentrancyGuard, IMigratorV2V3 {
     function skipCurrent() external onlyOwner {
         require(seeded && migrateIterator >= 0, "Nothing to skip");
         uint256 idx = uint256(migrateIterator);
-        emit UserMigrationSkipped(users[idx], 0);
+        emit UserMigrationSkipped(users[idx], 0, "");
         uint256 next = idx + 1;
         migrateIterator = next == users.length ? int256(-1) : int256(next);
         emit MigrateProgress(migrateIterator, users.length);

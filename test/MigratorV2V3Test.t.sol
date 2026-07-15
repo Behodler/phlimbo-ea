@@ -49,6 +49,14 @@ import "./Mocks.sol";
  *      index, "Nothing to skip" negatives, onlyOwner
  *  21. MINIMUM_STAKE boundary: a position exactly at the minimum migrates (skip
  *      is strictly `<`)
+ *
+ * Story 028 (audit-08 M-02 follow-up) widens UserMigrationSkipped with a `bytes
+ * reason`: the raw ABI-encoded revert data from a caught `migrateOne` revert,
+ * empty when the migration was skipped without being attempted:
+ *
+ *  22. Skip reasons: not-wired skips decode to Error(string) "Not authorized",
+ *      stale-debt skips carry Panic(0x11) intact, dust-band and skipCurrent
+ *      skips carry an empty reason (the not-attempted invariant)
  */
 contract MigratorV2V3Test is Test {
     // Re-declare events for expectEmit
@@ -62,7 +70,7 @@ contract MigratorV2V3Test is Test {
     );
     event MigrateProgress(int256 iterator, uint256 userCount);
     event RewardForwardFailed(address indexed token, address indexed user, uint256 amount);
-    event UserMigrationSkipped(address indexed user, uint256 amount);
+    event UserMigrationSkipped(address indexed user, uint256 amount, bytes reason);
     event UnclaimableClaimed(address indexed token, address indexed user, uint256 amount);
     event WithdrawnAll(
         address indexed owner, uint256 phUSDAmount, uint256 rewardAmount, uint256 promoAmount
@@ -327,7 +335,9 @@ contract MigratorV2V3Test is Test {
 
         freshMigrator.seedUsers(_oneUser(alice));
         vm.expectEmit(true, false, false, true);
-        emit UserMigrationSkipped(alice, 100 ether);
+        emit UserMigrationSkipped(
+            alice, 100 ether, abi.encodeWithSignature("Error(string)", "Not authorized")
+        );
         freshMigrator.migrate(1);
 
         assertEq(freshMigrator.migrateIterator(), int256(-1), "pass completed");
@@ -356,7 +366,9 @@ contract MigratorV2V3Test is Test {
 
         freshMigrator.seedUsers(_oneUser(alice));
         vm.expectEmit(true, false, false, true);
-        emit UserMigrationSkipped(alice, 100 ether);
+        emit UserMigrationSkipped(
+            alice, 100 ether, abi.encodeWithSignature("Error(string)", "Not authorized")
+        );
         freshMigrator.migrate(1);
 
         assertEq(freshMigrator.migrateIterator(), int256(-1), "pass completed");
@@ -986,7 +998,7 @@ contract MigratorV2V3Test is Test {
         migrator.seedUsers(list);
 
         vm.expectEmit(true, false, false, true);
-        emit UserMigrationSkipped(bob, 1);
+        emit UserMigrationSkipped(bob, 1, "");
         migrator.migrate(10);
 
         assertEq(migrator.migrateIterator(), int256(-1), "pass completed");
@@ -1034,7 +1046,7 @@ contract MigratorV2V3Test is Test {
         migrator.seedUsers(list);
 
         vm.expectEmit(true, false, false, true);
-        emit UserMigrationSkipped(bricked, 500 ether);
+        emit UserMigrationSkipped(bricked, 500 ether, stdError.arithmeticError);
         migrator.migrate(10);
 
         assertEq(migrator.migrateIterator(), int256(-1), "pass completed");
@@ -1087,7 +1099,7 @@ contract MigratorV2V3Test is Test {
         assertEq(migrator.migrateIterator(), int256(2), "cursor at carol");
 
         vm.expectEmit(true, false, false, true);
-        emit UserMigrationSkipped(carol, 0);
+        emit UserMigrationSkipped(carol, 0, "");
         vm.expectEmit(false, false, false, true);
         emit MigrateProgress(int256(3), 5);
         migrator.skipCurrent();
@@ -1110,7 +1122,7 @@ contract MigratorV2V3Test is Test {
         assertEq(migrator.migrateIterator(), int256(4), "cursor at the final index");
 
         vm.expectEmit(true, false, false, true);
-        emit UserMigrationSkipped(eve, 0);
+        emit UserMigrationSkipped(eve, 0, "");
         vm.expectEmit(false, false, false, true);
         emit MigrateProgress(int256(-1), 5);
         migrator.skipCurrent();
@@ -1158,5 +1170,130 @@ contract MigratorV2V3Test is Test {
         assertEq(migrator.migrateIterator(), int256(-1), "pass completed");
         assertEq(_v3Amount(alice), minStake, "exact-minimum position landed in V3");
         assertEq(_v2Amount(alice), 0, "position left V2");
+    }
+
+    // ============================================================
+    // 22. Skip reason payloads (story 028, audit-08 M-02 follow-up)
+    // ============================================================
+
+    /// @dev Extracts the `reason` of the first UserMigrationSkipped emitted by
+    ///      `emitter` for `user` since vm.recordLogs(). Fails if none was emitted.
+    function _recordedSkipReason(address emitter, address user)
+        internal
+        returns (bytes memory reason)
+    {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("UserMigrationSkipped(address,uint256,bytes)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (
+                logs[i].emitter == emitter && logs[i].topics[0] == sig
+                    && logs[i].topics[1] == bytes32(uint256(uint160(user)))
+            ) {
+                (, reason) = abi.decode(logs[i].data, (uint256, bytes));
+                return reason;
+            }
+        }
+        revert("UserMigrationSkipped not emitted for user");
+    }
+
+    /// @dev The misconfiguration diagnostic this story exists for: an unwired V2
+    ///      migrator's skip carries the raw revert data, decoding to
+    ///      Error(string) "Not authorized" — distinguishable off-chain from a
+    ///      genuinely bad position.
+    function test_migrate_not_wired_skip_reason_decodes_to_not_authorized() public {
+        PhlimboV2 freshV2 = new PhlimboV2(address(phUSD), address(stable), DEPLETION_DURATION);
+        PhlimboV3 freshV3 = new PhlimboV3(address(phUSD), address(stable), DEPLETION_DURATION);
+        MigratorV2V3 freshMigrator = new MigratorV2V3(
+            address(freshV2), address(freshV3), address(phUSD), address(stable)
+        );
+        freshV3.setMigrator(address(freshMigrator));
+        // NOTE: deliberately do NOT call freshV2.setMigrator(...)
+
+        phUSD.mint(alice, 100 ether);
+        vm.startPrank(alice);
+        phUSD.approve(address(freshV2), type(uint256).max);
+        freshV2.stake(100 ether, alice);
+        vm.stopPrank();
+
+        freshMigrator.seedUsers(_oneUser(alice));
+        vm.recordLogs();
+        freshMigrator.migrate(1);
+
+        bytes memory reason = _recordedSkipReason(address(freshMigrator), alice);
+        assertEq(
+            reason, abi.encodeWithSignature("Error(string)", "Not authorized"), "raw revert data"
+        );
+        assertTrue(bytes4(reason) == bytes4(keccak256("Error(string)")), "Error(string) selector");
+        bytes memory payload = new bytes(reason.length - 4);
+        for (uint256 j = 0; j < payload.length; j++) {
+            payload[j] = reason[j + 4];
+        }
+        assertEq(abi.decode(payload, (string)), "Not authorized", "decoded Error(string) message");
+    }
+
+    /// @dev The stale-debt vector's Panic(0x11) survives the catch intact: the
+    ///      emitted reason equals stdError.arithmeticError byte-for-byte.
+    function test_migrate_stale_debt_skip_reason_is_arithmetic_panic() public {
+        address bricked = dave;
+        _stakeThreeAtThousand(bricked);
+        _fundV2StableRewards();
+
+        vm.warp(block.timestamp + 30 days);
+
+        // Materialise a non-zero debt (debt is only written on stake/withdraw/claim).
+        vm.prank(bricked);
+        phlimboV2.claim(bricked);
+
+        // Pause; bricked emergency-exits HALF — amount halves, debt is untouched.
+        vm.prank(pauser);
+        phlimboV2.pause();
+        vm.prank(bricked);
+        phlimboV2.pauseWithdraw(500 ether);
+        vm.prank(pauser);
+        phlimboV2.unpause();
+
+        // Short window: underflow needs acc_now < 2*acc_then.
+        vm.warp(block.timestamp + 1 hours);
+
+        migrator.seedUsers(_oneUser(bricked));
+        vm.recordLogs();
+        migrator.migrate(10);
+
+        bytes memory reason = _recordedSkipReason(address(migrator), bricked);
+        assertEq(reason, stdError.arithmeticError, "Panic(0x11) revert data intact");
+    }
+
+    /// @dev Not-attempted invariant: a dust-band skip never calls migrateOne, so
+    ///      its reason is empty bytes.
+    function test_migrate_dust_skip_reason_is_empty() public {
+        _stakeThreeAtThousand(bob);
+
+        vm.prank(pauser);
+        phlimboV2.pause();
+        vm.prank(bob);
+        phlimboV2.pauseWithdraw(1000 ether - 1);
+        vm.prank(pauser);
+        phlimboV2.unpause();
+        assertEq(_v2Amount(bob), 1, "bob left 1 wei of dust in V2");
+
+        migrator.seedUsers(_oneUser(bob));
+        vm.recordLogs();
+        migrator.migrate(1);
+
+        bytes memory reason = _recordedSkipReason(address(migrator), bob);
+        assertEq(reason.length, 0, "dust skip was never attempted: empty reason");
+    }
+
+    /// @dev Not-attempted invariant: the skipCurrent owner backstop emits an
+    ///      empty reason.
+    function test_skipCurrent_skip_reason_is_empty() public {
+        _stakeInV2(alice, 100 ether);
+        migrator.seedUsers(_oneUser(alice));
+
+        vm.recordLogs();
+        migrator.skipCurrent();
+
+        bytes memory reason = _recordedSkipReason(address(migrator), alice);
+        assertEq(reason.length, 0, "skipCurrent never attempts: empty reason");
     }
 }
