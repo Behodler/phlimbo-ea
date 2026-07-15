@@ -96,8 +96,10 @@ contract MockFeeToken is ERC20 {
 /**
  * @title MockBlocklistToken
  * @notice ERC20 with a USDT-style recipient blocklist. Transfers to a blocked
- *         address revert — used to verify batchClaim's non-reverting transfer
- *         path banks failed amounts into unclaimablePromo.
+ *         address revert — used to verify the non-reverting transfer paths:
+ *         PhlimboV3 batchClaim banking failed amounts into unclaimablePromo, and
+ *         MigratorV2V3 migrate banking failed reward forwards into the per-user
+ *         `unclaimable` mapping (plus the claimUnclaimable pull path).
  */
 contract MockBlocklistToken is ERC20 {
     mapping(address => bool) public blocked;
