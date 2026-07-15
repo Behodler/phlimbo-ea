@@ -326,6 +326,7 @@ interface IPhlimboV3 {
     function hook() external view returns (IPhlimboHook);
     function PRECISION() external view returns (uint256);
     function SECONDS_PER_YEAR() external view returns (uint256);
+    function MINIMUM_STAKE() external view returns (uint256);
     function userInfo(address user)
         external
         view

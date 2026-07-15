@@ -54,12 +54,25 @@ import "./interfaces/IMigratorV2V3.sol";
  *         NO phUSD mint role is needed on this contract — V2 itself mints the
  *         pending phUSD rewards during `withdraw`.
  *
- *         Recovery note: reward forwarding never reverts. Each delta is sent with
- *         the non-reverting `_tryTransfer`; if a recipient cannot receive a token
- *         (e.g. a blocklisted address), the amount is banked into the per-user
- *         `unclaimable` mapping and `RewardForwardFailed` is emitted, so the cursor
- *         always advances and a single bad recipient can never brick a pass. Banked
- *         amounts are pulled by the affected user via the permissionless
+ *         Recovery note: the ENTIRE per-user body (live read, V2 withdraw, V3
+ *         stake, reward forwarding) runs inside a try/catch'd `migrateOne`
+ *         self-call, so a position that reverts anywhere in it — a stale-debt V2
+ *         position that panics in `_claimRewards`, or anything unforeseen — is
+ *         skipped atomically: `UserMigrationSkipped` is emitted, the user's V2
+ *         position is left untouched for a later targeted pass (seeded from those
+ *         events once this pass completes), and the cursor advances. Positions
+ *         below V3's MINIMUM_STAKE (dust that `stake` would reject) are skipped
+ *         up-front with the same event. The try/catch absorbs REVERTS, not gas
+ *         exhaustion: under the 63/64 rule an out-of-gas `migrateOne` can starve
+ *         the remainder of the pass — mitigated by calling `migrate` with a
+ *         smaller `maxIterations`, and the owner-only `skipCurrent` is the
+ *         backstop that steps the cursor past a stalling index. Within a
+ *         successful iteration, reward forwarding additionally never reverts:
+ *         each delta is sent with the non-reverting `_tryTransfer`; if a recipient
+ *         cannot receive a token (e.g. a blocklisted address), the amount is
+ *         banked into the per-user `unclaimable` mapping and `RewardForwardFailed`
+ *         is emitted. Banked amounts are pulled by the affected user via the
+ *         permissionless
  *         `claimUnclaimable` once they can receive again. `withdrawAll` remains a
  *         LAST-DITCH escape hatch: it sweeps this contract's ENTIRE phUSD,
  *         reward-token and (live) promo-token balances, INCLUDING amounts banked in
@@ -143,9 +156,12 @@ contract MigratorV2V3 is Ownable, ReentrancyGuard, IMigratorV2V3 {
      * @inheritdoc IMigratorV2V3
      * @dev Live-read chunked loop over `[cursor, min(cursor + maxIterations, len))`.
      *      Skip-on-zero: a user who exited V2 (or was already migrated) is silently
-     *      passed over and the cursor advances. The balance-diff bracket spans the
-     *      V2 withdraw AND the V3 stake, so the principal nets out of the phUSD
-     *      delta and any V3 auto-claimed rewards (second pass) are forwarded too.
+     *      passed over. Skip-on-dust: a live position below V3's MINIMUM_STAKE can
+     *      never be staked into V3, so it is passed over with UserMigrationSkipped
+     *      (audit-08 M-02, vector 1a). Each remaining per-user body runs as a
+     *      try/catch'd `migrateOne` self-call — a reverting position (e.g. a
+     *      stale-debt V2 position, vector 1b) is skipped with the same event, so
+     *      the cursor ALWAYS advances.
      */
     function migrate(uint256 maxIterations) external nonReentrant {
         require(seeded, "Not seeded");
@@ -155,10 +171,8 @@ contract MigratorV2V3 is Ownable, ReentrancyGuard, IMigratorV2V3 {
         // Max-approve PhlimboV3 once per call. forceApprove is idempotent-safe.
         phUSD.forceApprove(address(phlimboV3), type(uint256).max);
 
-        // Live promo slot: bracketed only so a straggler second pass forwards a
-        // user's V3 auto-claimed promo instead of stranding it here. V3 guarantees
-        // promoToken is never phUSD or rewardToken. address(0) = no promotion.
-        IERC20 promoToken = phlimboV3.promoToken();
+        // Cached once: MINIMUM_STAKE is a compile-time constant on PhlimboV3.
+        uint256 minStake = phlimboV3.MINIMUM_STAKE();
 
         uint256 i = uint256(migrateIterator);
         uint256 end = i + maxIterations;
@@ -171,39 +185,20 @@ contract MigratorV2V3 is Ownable, ReentrancyGuard, IMigratorV2V3 {
             // LIVE read — robust to mid-migration V2 exits / partial withdrawals.
             (uint256 amount,,) = phlimboV2.userInfo(user);
             if (amount == 0) continue; // exited or already migrated
-
-            uint256 phUSDBefore = phUSD.balanceOf(address(this));
-            uint256 stableBefore = rewardToken.balanceOf(address(this));
-            uint256 promoBefore =
-                address(promoToken) != address(0) ? promoToken.balanceOf(address(this)) : 0;
-
-            // Wiring prerequisite (a): phlimboV2.setMigrator(this). Delivers the
-            // principal + auto-claimed stable + freshly minted phUSD rewards here.
-            phlimboV2.withdraw(amount, user);
-
-            // Wiring prerequisite (b): phlimboV3.setMigrator(this). Restakes the
-            // principal for the user; promoDebt is set against the current
-            // accPromoPerShare → no retroactive promo accrual. Any V3 auto-claim
-            // (second pass only) lands here and is included in the deltas below.
-            phlimboV3.stake(amount, user);
-
-            // The principal was received then restaked, so it nets out: the phUSD
-            // delta is exactly the reward component.
-            uint256 phUSDRewards = phUSD.balanceOf(address(this)) - phUSDBefore;
-            uint256 stableRewards = rewardToken.balanceOf(address(this)) - stableBefore;
-            uint256 promoRewards = address(promoToken) != address(0)
-                ? promoToken.balanceOf(address(this)) - promoBefore
-                : 0;
-
-            // Non-reverting forwarding (audit-07 M-01): a recipient that cannot
-            // receive a token banks into `unclaimable` instead of bricking the pass.
-            _forward(IERC20(address(phUSD)), user, phUSDRewards);
-            _forward(rewardToken, user, stableRewards);
-            if (address(promoToken) != address(0)) {
-                _forward(promoToken, user, promoRewards);
+            if (amount < minStake) {
+                // Dust that phlimboV3.stake would reject ("Below minimum stake").
+                // The position stays in V2 and remains the user's.
+                emit UserMigrationSkipped(user, amount);
+                continue;
             }
 
-            emit UserMigrated(user, amount, phUSDRewards, stableRewards, promoRewards);
+            try this.migrateOne(user, amount) {
+                // UserMigrated emitted inside migrateOne.
+            } catch {
+                // The whole iteration reverted atomically (bracket included); the
+                // user's V2 position is untouched and the cursor still advances.
+                emit UserMigrationSkipped(user, amount);
+            }
         }
 
         if (i == len) {
@@ -213,6 +208,76 @@ contract MigratorV2V3 is Ownable, ReentrancyGuard, IMigratorV2V3 {
         }
 
         emit MigrateProgress(migrateIterator, len);
+    }
+
+    /**
+     * @inheritdoc IMigratorV2V3
+     * @dev Self-call ONLY — the `migrate` loop's try/catch target. A revert
+     *      anywhere in here unwinds the whole iteration (bracket, withdraw, stake,
+     *      forwarding together); `migrate` catches it, emits UserMigrationSkipped
+     *      and advances the cursor. MUST NOT carry `nonReentrant`: OZ v5's
+     *      ReentrancyGuard is a single lock shared across all guarded functions,
+     *      and `migrate` already holds it when it self-calls — a guarded
+     *      migrateOne would revert ReentrancyGuardReentrantCall and the catch
+     *      would silently skip EVERY user. Protected by the "Only self" gate
+     *      instead.
+     */
+    function migrateOne(address user, uint256 amount) external {
+        require(msg.sender == address(this), "Only self");
+
+        // Live promo slot: bracketed only so a straggler second pass forwards a
+        // user's V3 auto-claimed promo instead of stranding it here. V3 guarantees
+        // promoToken is never phUSD or rewardToken. address(0) = no promotion.
+        IERC20 promoToken = phlimboV3.promoToken();
+
+        uint256 phUSDBefore = phUSD.balanceOf(address(this));
+        uint256 stableBefore = rewardToken.balanceOf(address(this));
+        uint256 promoBefore =
+            address(promoToken) != address(0) ? promoToken.balanceOf(address(this)) : 0;
+
+        // Wiring prerequisite (a): phlimboV2.setMigrator(this). Delivers the
+        // principal + auto-claimed stable + freshly minted phUSD rewards here.
+        phlimboV2.withdraw(amount, user);
+
+        // Wiring prerequisite (b): phlimboV3.setMigrator(this). Restakes the
+        // principal for the user; promoDebt is set against the current
+        // accPromoPerShare → no retroactive promo accrual. Any V3 auto-claim
+        // (second pass only) lands here and is included in the deltas below.
+        phlimboV3.stake(amount, user);
+
+        // The principal was received then restaked, so it nets out: the phUSD
+        // delta is exactly the reward component.
+        uint256 phUSDRewards = phUSD.balanceOf(address(this)) - phUSDBefore;
+        uint256 stableRewards = rewardToken.balanceOf(address(this)) - stableBefore;
+        uint256 promoRewards = address(promoToken) != address(0)
+            ? promoToken.balanceOf(address(this)) - promoBefore
+            : 0;
+
+        // Non-reverting forwarding (audit-07 M-01): a recipient that cannot
+        // receive a token banks into `unclaimable` instead of bricking the pass.
+        _forward(IERC20(address(phUSD)), user, phUSDRewards);
+        _forward(rewardToken, user, stableRewards);
+        if (address(promoToken) != address(0)) {
+            _forward(promoToken, user, promoRewards);
+        }
+
+        emit UserMigrated(user, amount, phUSDRewards, stableRewards, promoRewards);
+    }
+
+    /**
+     * @inheritdoc IMigratorV2V3
+     * @dev Owner backstop for a stall the try/catch cannot absorb (e.g. gas
+     *      exhaustion under the 63/64 rule). Does NOT touch the skipped user's V2
+     *      position. Mirrors migrate's completion semantics: -1 when the skip
+     *      consumes the final index.
+     */
+    function skipCurrent() external onlyOwner {
+        require(seeded && migrateIterator >= 0, "Nothing to skip");
+        uint256 idx = uint256(migrateIterator);
+        emit UserMigrationSkipped(users[idx], 0);
+        uint256 next = idx + 1;
+        migrateIterator = next == users.length ? int256(-1) : int256(next);
+        emit MigrateProgress(migrateIterator, users.length);
     }
 
     // ========================== UNCLAIMABLE ==========================

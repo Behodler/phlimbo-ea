@@ -56,6 +56,19 @@ interface IMigratorV2V3 {
     event RewardForwardFailed(address indexed token, address indexed user, uint256 amount);
 
     /**
+     * @notice Emitted when a user's index is passed over without migrating: their
+     *         live V2 position is below PhlimboV3's MINIMUM_STAKE (dust), their
+     *         `migrateOne` self-call reverted (e.g. a stale-debt V2 position), or
+     *         the owner stepped past them via `skipCurrent`. Informational only:
+     *         the skipped user's V2 position is untouched and remains theirs — the
+     *         owner handles skipped users in a later targeted pass seeded from
+     *         these events.
+     * @param user The user whose index was skipped.
+     * @param amount The live V2 amount observed at skip time (0 for skipCurrent).
+     */
+    event UserMigrationSkipped(address indexed user, uint256 amount);
+
+    /**
      * @notice Emitted when a user pulls a banked reward via claimUnclaimable.
      * @param token The reward token claimed.
      * @param user The claiming user.
@@ -95,6 +108,29 @@ interface IMigratorV2V3 {
      * @param maxIterations Maximum number of users to process in this call.
      */
     function migrate(uint256 maxIterations) external;
+
+    /**
+     * @notice Migrates a single user: V2 withdraw, V3 restake, reward-delta
+     *         forwarding. NOT FOR EXTERNAL CALLERS — this function is SELF-CALL
+     *         GATED (`require(msg.sender == address(this))`) and exists ONLY so
+     *         `migrate` can wrap each per-user body in try/catch and skip a
+     *         reverting position instead of bricking the pass. It is `external`
+     *         purely because Solidity's try/catch requires an external call; any
+     *         caller other than the migrator contract itself reverts "Only self".
+     * @param user The seeded user to migrate.
+     * @param amount The user's live V2 position, read by `migrate`.
+     */
+    function migrateOne(address user, uint256 amount) external;
+
+    /**
+     * @notice Owner-only backstop: advances the migration cursor past the current
+     *         index WITHOUT touching that user's V2 position, emitting
+     *         UserMigrationSkipped(user, 0). For use if the cursor ever stalls in
+     *         a way the migrateOne try/catch cannot absorb (e.g. gas exhaustion
+     *         under the 63/64 rule). Sets the iterator to -1 when the skip
+     *         consumes the final index, matching migrate's completion semantics.
+     */
+    function skipCurrent() external;
 
     /**
      * @notice Permissionless pull of a reward amount that could not be forwarded to
