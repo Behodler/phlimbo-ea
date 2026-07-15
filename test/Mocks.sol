@@ -122,6 +122,59 @@ contract MockBlocklistToken is ERC20 {
 }
 
 /**
+ * @title MockPausableToken
+ * @notice ERC20 with a token-wide pause (probe B2): ALL transfers revert while
+ *         paused. Used to verify that a full-population flush failure banks 100%
+ *         of the distributed promo and that every staker recovers via
+ *         claimUnclaimablePromo after the token unpauses.
+ */
+contract MockPausableToken is ERC20 {
+    bool public paused;
+
+    constructor() ERC20("Mock Pausable Token", "mPAUSE") {}
+
+    function setPaused(bool isPaused) external {
+        paused = isPaused;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        require(!paused, "token paused");
+        super._update(from, to, value);
+    }
+}
+
+/**
+ * @title MockFalseReturnToken
+ * @notice ERC20 whose `transfer` returns false (without reverting and without
+ *         moving tokens) for flagged recipients — covers _tryTransfer's
+ *         returndata-decode false branch, which no reverting mock can reach.
+ */
+contract MockFalseReturnToken is ERC20 {
+    mapping(address => bool) public failFor;
+
+    constructor() ERC20("Mock False Return Token", "mFALSE") {}
+
+    function setFail(address account, bool shouldFail) external {
+        failFor[account] = shouldFail;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function transfer(address to, uint256 value) public override returns (bool) {
+        if (failFor[to]) {
+            return false;
+        }
+        return super.transfer(to, value);
+    }
+}
+
+/**
  * @title MockPhlimboHook
  * @notice Records every call from PhlimboV2 so tests can assert on caller/user/amount.
  */

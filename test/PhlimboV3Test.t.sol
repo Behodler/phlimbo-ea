@@ -1684,6 +1684,307 @@ contract PhlimboV3Test is Test {
     }
 
     // ============================================================
+    // V3 AUDIT-08 M-01: PER-USER PROMO BANK + PERMISSIONLESS PULL
+    // ============================================================
+
+    /// @dev alice (1x) + bob (3x) staked, promo on a blocklist token streamed to
+    ///      half-window, alice blocked, flush run to completion (phase Flushing).
+    function _bankAliceBlocked() internal returns (MockBlocklistToken blk, uint256 alicePending) {
+        blk = new MockBlocklistToken();
+        blk.mint(owner, PROMO_AMOUNT);
+        blk.approve(address(phlimbo), type(uint256).max);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT * 3, bob);
+
+        phlimbo.startPromotion(address(blk), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        alicePending = phlimbo.pendingPromo(alice);
+        blk.setBlocked(alice, true);
+
+        phlimbo.beginFlush();
+        phlimbo.batchClaim(10);
+    }
+
+    function test_claimUnclaimablePromo_after_unblock_makes_user_whole() public {
+        (MockBlocklistToken blk, uint256 alicePending) = _bankAliceBlocked();
+
+        blk.setBlocked(alice, false);
+
+        vm.expectEmit(true, true, false, true);
+        emit UnclaimablePromoClaimed(address(blk), alice, alicePending);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePromo(address(blk));
+
+        assertEq(blk.balanceOf(alice), alicePending, "made whole");
+        assertEq(phlimbo.unclaimablePromoOf(address(blk), alice), 0, "per-user entry zeroed");
+        assertEq(phlimbo.totalUnclaimableOf(address(blk)), 0, "aggregate decremented");
+
+        // Entry zeroed → a second pull reverts.
+        vm.prank(alice);
+        vm.expectRevert("Nothing to claim");
+        phlimbo.claimUnclaimablePromo(address(blk));
+    }
+
+    /// @dev Bug-1 regression (underflow-brick guard): after a mid-flush pull the
+    ///      aggregate MUST have been decremented, or finalizePromotion's sweep
+    ///      would underflow and pin the contract in Flushing forever. Also proves
+    ///      the pull is deliberately ungated: it succeeds while the contract is
+    ///      paused for the flush (mid-flush self-rescue).
+    function test_bank_pull_then_finalize_does_not_revert() public {
+        (MockBlocklistToken blk, uint256 alicePending) = _bankAliceBlocked();
+
+        // Mid-flush: contract is paused, phase Flushing. Pull must still work.
+        assertTrue(phlimbo.paused(), "contract paused during flush");
+        blk.setBlocked(alice, false);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePromo(address(blk));
+        assertEq(blk.balanceOf(alice), alicePending, "self-rescued mid-flush");
+
+        // Tokens left the contract AND the aggregate was decremented, so the
+        // sweep must not underflow-revert (the audit's snippet bricked here).
+        address recipient = address(0x99);
+        uint256 remaining = blk.balanceOf(address(phlimbo));
+        phlimbo.finalizePromotion(recipient);
+        assertEq(blk.balanceOf(recipient), remaining, "full unencumbered balance swept");
+        assertEq(uint256(phlimbo.promoPhase()), uint256(IPhlimboV3.PromoPhase.None), "rotation completed");
+    }
+
+    /// @dev Bug-1 `= 0`-variant regression: the aggregate spans ALL users, so one
+    ///      user's pull must decrement it by their amount only — zeroing it would
+    ///      erase the other user's reservation and let the sweep confiscate it.
+    function test_two_banked_one_pulls_other_bank_still_backed() public {
+        MockBlocklistToken blk = new MockBlocklistToken();
+        blk.mint(owner, PROMO_AMOUNT);
+        blk.approve(address(phlimbo), type(uint256).max);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT * 3, bob);
+
+        phlimbo.startPromotion(address(blk), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        uint256 alicePending = phlimbo.pendingPromo(alice);
+        uint256 bobPending = phlimbo.pendingPromo(bob);
+        blk.setBlocked(alice, true);
+        blk.setBlocked(bob, true);
+
+        phlimbo.beginFlush();
+        phlimbo.batchClaim(10);
+        assertEq(phlimbo.totalUnclaimableOf(address(blk)), alicePending + bobPending, "both banked");
+
+        // Alice pulls; the aggregate must retain exactly bob's reservation.
+        blk.setBlocked(alice, false);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePromo(address(blk));
+        assertEq(phlimbo.totalUnclaimableOf(address(blk)), bobPending, "decremented, not zeroed");
+
+        // Finalize sweeps only balance − bob's bank…
+        address recipient = address(0x99);
+        uint256 balance = blk.balanceOf(address(phlimbo));
+        phlimbo.finalizePromotion(recipient);
+        assertEq(blk.balanceOf(recipient), balance - bobPending, "bob's bank reserved from sweep");
+        assertEq(blk.balanceOf(address(phlimbo)), bobPending, "bob's bank fully backed");
+
+        // …and bob remains claimable after the rotation.
+        blk.setBlocked(bob, false);
+        vm.prank(bob);
+        phlimbo.claimUnclaimablePromo(address(blk));
+        assertEq(blk.balanceOf(bob), bobPending, "bob made whole post-rotation");
+    }
+
+    function test_finalize_reserves_bank_and_bank_claimable_after_rotation() public {
+        (MockBlocklistToken blk, uint256 alicePending) = _bankAliceBlocked();
+
+        address recipient = address(0x99);
+        uint256 balance = blk.balanceOf(address(phlimbo));
+        phlimbo.finalizePromotion(recipient);
+
+        assertEq(blk.balanceOf(recipient), balance - alicePending, "sweeps balance - banked");
+        assertEq(blk.balanceOf(address(phlimbo)), alicePending, "bank retained");
+        assertEq(uint256(phlimbo.promoPhase()), uint256(IPhlimboV3.PromoPhase.None));
+        phlimbo.unpause();
+
+        // Retired token (promoToken == 0): the bank is still pullable.
+        blk.setBlocked(alice, false);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePromo(address(blk));
+        assertEq(blk.balanceOf(alice), alicePending, "claimable after promoPhase == None");
+        assertEq(blk.balanceOf(address(phlimbo)), 0, "bank fully drained");
+    }
+
+    /// @dev Probe B2: token-wide pause — every flush transfer fails, 100% of the
+    ///      distributed promo is banked, the sweep sends 0, and all stakers recover.
+    function test_tokenwide_pause_banks_all_and_all_recover() public {
+        MockPausableToken pausable = new MockPausableToken();
+        pausable.mint(owner, PROMO_AMOUNT);
+        pausable.approve(address(phlimbo), type(uint256).max);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT * 3, bob);
+
+        phlimbo.startPromotion(address(pausable), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION); // full window: entire Q distributed
+
+        pausable.setPaused(true);
+
+        phlimbo.beginFlush();
+        phlimbo.batchClaim(10);
+
+        uint256 aliceBank = phlimbo.unclaimablePromoOf(address(pausable), alice);
+        uint256 bobBank = phlimbo.unclaimablePromoOf(address(pausable), bob);
+        assertEq(aliceBank + bobBank, PROMO_AMOUNT, "100% of funded promo banked");
+        assertEq(phlimbo.totalUnclaimableOf(address(pausable)), PROMO_AMOUNT);
+
+        // Sweep sends ~0 to leftoverRecipient — everything is reserved.
+        address recipient = address(0x99);
+        phlimbo.finalizePromotion(recipient);
+        assertEq(pausable.balanceOf(recipient), 0, "nothing unencumbered to sweep");
+        assertEq(pausable.balanceOf(address(phlimbo)), PROMO_AMOUNT, "entire bank retained");
+
+        // Token recovers: every staker pulls in full.
+        pausable.setPaused(false);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePromo(address(pausable));
+        vm.prank(bob);
+        phlimbo.claimUnclaimablePromo(address(pausable));
+        assertEq(pausable.balanceOf(alice), aliceBank, "alice recovered");
+        assertEq(pausable.balanceOf(bob), bobBank, "bob recovered");
+        assertEq(phlimbo.totalUnclaimableOf(address(pausable)), 0, "aggregate drained");
+    }
+
+    function test_claimUnclaimablePromo_reverts_on_zero_balance() public {
+        vm.prank(alice);
+        vm.expectRevert("Nothing to claim");
+        phlimbo.claimUnclaimablePromo(address(partner));
+    }
+
+    function test_claimUnclaimablePromo_while_still_blocked_reverts() public {
+        (MockBlocklistToken blk, uint256 alicePending) = _bankAliceBlocked();
+
+        // Still blocked: the user-initiated pull deliberately reverts (reverting
+        // safeTransfer, not _tryTransfer) and the bank is preserved.
+        vm.prank(alice);
+        vm.expectRevert("recipient blocked");
+        phlimbo.claimUnclaimablePromo(address(blk));
+
+        assertEq(phlimbo.unclaimablePromoOf(address(blk), alice), alicePending, "entry preserved on revert");
+        assertEq(phlimbo.totalUnclaimableOf(address(blk)), alicePending, "aggregate preserved on revert");
+    }
+
+    function test_claimUnclaimablePromo_is_permissionless_but_self_scoped() public {
+        (MockBlocklistToken blk, uint256 alicePending) = _bankAliceBlocked();
+        blk.setBlocked(alice, false);
+
+        // eve (no role, no bank) cannot pull alice's entitlement…
+        vm.prank(eve);
+        vm.expectRevert("Nothing to claim");
+        phlimbo.claimUnclaimablePromo(address(blk));
+
+        // …while alice needs no role at all to pull her own.
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePromo(address(blk));
+        assertEq(blk.balanceOf(alice), alicePending, "owner of the bank pulls without any role");
+    }
+
+    /// @dev Bug-2 regression: banks are keyed per token — a retired token's bank
+    ///      is untouched by a later promotion's accounting and its rotation sweep.
+    function test_sequential_promotions_retired_token_bank_isolated() public {
+        (MockBlocklistToken blk, uint256 alicePending) = _bankAliceBlocked();
+
+        address recipient = address(0x99);
+        phlimbo.finalizePromotion(recipient);
+        phlimbo.unpause();
+
+        // Promotion B on a different token; full rotation with successful payouts.
+        phlimbo.startPromotion(address(partner), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+        phlimbo.beginFlush();
+        phlimbo.batchClaim(10);
+        phlimbo.finalizePromotion(recipient);
+        phlimbo.unpause();
+
+        // B banked nothing; A's bank is untouched by B's accounting and sweep.
+        assertEq(phlimbo.totalUnclaimableOf(address(partner)), 0, "token B banked nothing");
+        assertEq(phlimbo.unclaimablePromoOf(address(blk), alice), alicePending, "token A bank unaffected");
+        assertEq(blk.balanceOf(address(phlimbo)), alicePending, "token A bank still backed");
+
+        blk.setBlocked(alice, false);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePromo(address(blk));
+        assertEq(blk.balanceOf(alice), alicePending, "retired-token bank claimable after promotion B");
+    }
+
+    /// @dev abortFlush resets neither flushCursor nor the bank: a stale bank rides
+    ///      into a resumed flush. Re-flushed users bank nothing further (debts
+    ///      already aligned) and the finalize sweep still reserves the stale bank.
+    function test_abortFlush_stale_bank_rides_into_resumed_flush() public {
+        (MockBlocklistToken blk, uint256 alicePending) = _bankAliceBlocked();
+
+        phlimbo.abortFlush();
+        phlimbo.unpause();
+        assertEq(phlimbo.totalUnclaimableOf(address(blk)), alicePending, "bank not reset by abortFlush");
+
+        // Resume the rotation: nobody banks again (pending == 0, debts aligned).
+        phlimbo.beginFlush();
+        phlimbo.batchClaim(10);
+        assertEq(phlimbo.totalUnclaimableOf(address(blk)), alicePending, "no double-bank on re-flush");
+
+        // The sweep must not assume the bank is zero at beginFlush.
+        address recipient = address(0x99);
+        uint256 balance = blk.balanceOf(address(phlimbo));
+        phlimbo.finalizePromotion(recipient);
+        assertEq(blk.balanceOf(recipient), balance - alicePending, "stale bank reserved from sweep");
+
+        blk.setBlocked(alice, false);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePromo(address(blk));
+        assertEq(blk.balanceOf(alice), alicePending, "stale bank still claimable");
+    }
+
+    /// @dev Coverage win: _tryTransfer's "returns false without reverting" branch —
+    ///      a false-returning (non-reverting) transfer must bank exactly like a
+    ///      reverting one, and no tokens may move.
+    function test_batchClaim_false_return_transfer_banks() public {
+        MockFalseReturnToken fr = new MockFalseReturnToken();
+        fr.mint(owner, PROMO_AMOUNT);
+        fr.approve(address(phlimbo), type(uint256).max);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT * 3, bob);
+
+        phlimbo.startPromotion(address(fr), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        uint256 alicePending = phlimbo.pendingPromo(alice);
+        uint256 bobPending = phlimbo.pendingPromo(bob);
+        fr.setFail(alice, true);
+
+        phlimbo.beginFlush();
+        vm.expectEmit(true, true, false, true);
+        emit PromoClaimFailed(address(fr), alice, alicePending);
+        phlimbo.batchClaim(10);
+
+        assertEq(fr.balanceOf(alice), 0, "false-return moved no tokens");
+        assertEq(fr.balanceOf(bob), bobPending, "bob still paid");
+        assertEq(phlimbo.unclaimablePromoOf(address(fr), alice), alicePending, "false-return banked");
+
+        fr.setFail(alice, false);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePromo(address(fr));
+        assertEq(fr.balanceOf(alice), alicePending, "recovered via pull");
+    }
+
+    // ============================================================
     // V3 PHASE 3: FINALIZE SWEEP + SLOT ZEROING
     // ============================================================
 
@@ -1752,6 +2053,40 @@ contract PhlimboV3Test is Test {
         assertEq(rewardToken.balanceOf(recipient), 100 ether, "reward token swept");
         assertEq(phUSD.balanceOf(recipient), STAKE_AMOUNT, "phUSD swept");
         assertEq(partner.balanceOf(address(phlimbo)), 0);
+    }
+
+    /// @dev Accepted trade-off (audit-08 M-01): emergencyTransfer sweeps the LIVE
+    ///      promo token's entire balance INCLUDING per-user banked amounts —
+    ///      asymmetric with finalizePromotion, which reserves the bank.
+    function test_emergencyTransfer_sweeps_live_token_bank_tradeoff() public {
+        MockBlocklistToken blk = new MockBlocklistToken();
+        blk.mint(owner, PROMO_AMOUNT);
+        blk.approve(address(phlimbo), type(uint256).max);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        phlimbo.startPromotion(address(blk), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + PROMO_DURATION / 2);
+
+        blk.setBlocked(alice, true);
+        phlimbo.beginFlush();
+        phlimbo.batchClaim(10);
+        uint256 banked = phlimbo.unclaimablePromoOf(address(blk), alice);
+        assertGt(banked, 0, "alice banked");
+
+        // Leave the flush (emergencyTransfer ends with _pause(), so it cannot run
+        // while already paused); the promo slot stays live and the bank persists.
+        phlimbo.abortFlush();
+        phlimbo.unpause();
+
+        // Escape hatch while the promo slot is still live: bank is swept along.
+        address recipient = address(0x99);
+        phlimbo.emergencyTransfer(recipient);
+        assertEq(blk.balanceOf(recipient), PROMO_AMOUNT, "entire balance incl. bank swept");
+        assertEq(blk.balanceOf(address(phlimbo)), 0, "nothing left backing the bank");
+        // The mapping entry remains (out-of-band owner obligation to make whole).
+        assertEq(phlimbo.unclaimablePromoOf(address(blk), alice), banked, "bank record persists unbacked");
     }
 
     // ============================================================
