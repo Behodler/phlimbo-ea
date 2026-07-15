@@ -12,7 +12,7 @@ argument and tooling. All views referenced here are on `PhlimboV3` /
 | phUSD principal | `stake` | `withdraw`, `pauseWithdraw`, `emergencyTransfer` | held 1:1 in the contract |
 | phUSD rewards | minted at claim time | `claim`/`stake`/`withdraw` settlement | phUSD mint privilege (not pre-funded) |
 | stable `rewardToken` | `collectReward` | reward settlement, `emergencyTransfer` | pre-funded, capped linear depletion |
-| `promoToken` | `startPromotion`, `topUpPromotion` | reward settlement, `batchClaim`, `finalizePromotion` sweep, `emergencyTransfer` | pre-funded, capped linear depletion |
+| `promoToken` | `startPromotion`, `topUpPromotion` | reward settlement, `batchClaim`, `finalizePromotion` sweep, `emergencyTransfer`, `claimUnclaimablePromo` | pre-funded, capped linear depletion |
 
 ## 1. Staked principal (phUSD)
 
@@ -78,8 +78,21 @@ Invariant while a promotion exists (phase Active or Flushing):
 ```
 promoToken.balanceOf(phlimbo) >= promoRewardBalance
                                 + Σ_user pendingPromo(user)
-                                + unclaimablePromo
+                                + totalUnclaimableOf[promoToken]
 ```
+
+A separate invariant holds for every token `t` ever used as a promo token,
+including retired ones (`promoToken == address(0)` or rotated to another token):
+
+```
+t.balanceOf(phlimbo) >= totalUnclaimableOf[t]
+```
+
+because `finalizePromotion` reserves the bank from its sweep and the only exit
+for a banked amount is the user's own `claimUnclaimablePromo` pull, which
+decrements `totalUnclaimableOf[t]` by exactly the amount transferred.
+(`emergencyTransfer` is the owner-gated exception for the *live* token only —
+it sweeps the live token's bank; a retired token's bank is out of its reach.)
 
 Why it holds:
 
@@ -95,22 +108,33 @@ Why it holds:
   `batchClaim` both pay exactly `amount * accPromoPerShare / PRECISION −
   promoDebt` and realign the debt. Floor division leaves dust in the contract
   (protocol-favouring, as in §3).
-- **Failed transfers stay inside.** A transfer that fails during the flush is
-  banked into `unclaimablePromo` (event `PromoClaimFailed`) with the user's debt
-  still aligned; the tokens never left, so the invariant is undisturbed.
+- **Failed transfers stay inside — and stay owed.** A transfer that fails during
+  the flush is banked per-user into `unclaimablePromoOf[token][user]` (and into
+  the per-token aggregate `totalUnclaimableOf[token]`; event `PromoClaimFailed`)
+  with the user's debt still aligned. The tokens never left, so the invariant is
+  undisturbed, and the entitlement survives as a pullable liability
+  (`claimUnclaimablePromo`) rather than being erased. `pendingPromo` reads 0 for
+  a banked user **by design** — the liability lives in the bank views, not in
+  pending.
 
 ### Rotation solvency (why finalize cannot strand liabilities)
 
 `finalizePromotion` is only reachable when `flushCursor == stakerCount()` over a
 set frozen by the pause, i.e. after **every** staker's pending was either paid or
 banked and every `promoDebt` aligned to `accPromoPerShare`. At that moment
-`Σ pendingPromo == 0`, so the entire remaining balance (undistributed remainder +
-rounding dust + `unclaimablePromo`) is unencumbered and is swept to
-`leftoverRecipient`. The slot is cleared (`promoToken`/rate/balance/
-`unclaimablePromo` zeroed) but **`accPromoPerShare` is never reset** — debts are
-aligned to it, so pending against the next partner token starts at exactly zero
-with no cross-token liability. After finalize the invariant above is trivially
-`0 >= 0`.
+`Σ pendingPromo == 0`, but banked amounts are still owed to users, so the sweep
+sends only the unencumbered portion —
+`balanceOf(this) − totalUnclaimableOf[retiredToken]`, saturating at zero so the
+finalize can never be bricked by accounting drift — to `leftoverRecipient`
+(undistributed remainder + rounding dust + `pauseWithdraw` forfeits, which are
+never banked and are legitimately swept). The bank (`unclaimablePromoOf` /
+`totalUnclaimableOf`) is **not** cleared: it survives the rotation, fully
+backed, until each user pulls it. The slot is cleared (`promoToken`/rate/balance
+zeroed) but **`accPromoPerShare` is never reset** — debts are aligned to it, so
+pending against the next partner token starts at exactly zero with no
+cross-token liability. After finalize the live-slot invariant above is trivially
+`0 >= 0`, and the retired-token invariant
+`t.balanceOf(phlimbo) >= totalUnclaimableOf[t]` continues to hold.
 
 `abortFlush` is solvency-neutral: `batchClaim` payments were correct early
 claims, so returning to Active leaves state consistent.
@@ -120,7 +144,11 @@ claims, so returning to Active leaves state consistent.
 Per-user views:
 
 - `pendingPhUSD(user)`, `pendingStable(user)`, `pendingPromo(user)` — live
-  pending including un-checkpointed accrual since `lastRewardTime`.
+  pending including un-checkpointed accrual since `lastRewardTime`. Note:
+  `pendingPromo` deliberately excludes banked failed-transfer amounts.
+- `unclaimablePromoOf(token, user)` — the user's banked promo for `token` (set
+  when their flush transfer failed), pullable via `claimUnclaimablePromo(token)`.
+  Works for retired tokens too.
 - `userInfo(user)` → `(amount, phUSDDebt, stableDebt, promoDebt)`.
 
 Aggregate views:
@@ -133,8 +161,9 @@ Aggregate views:
 - `getPromoInfo()` → `(promoToken, promoRewardBalance, promoRewardPerSecond,
   promoDepletionDuration, promoPhase, flushCursor)` — one call gives the promo
   slot's full funding/rate/rotation state.
-- `unclaimablePromo()` — banked failed-transfer liabilities awaiting the
-  finalize sweep.
+- `totalUnclaimableOf(token)` — total banked failed-transfer liabilities for
+  `token` (live or retired), reserved from the finalize sweep and outstanding
+  until users pull them via `claimUnclaimablePromo`.
 
 Solvency check procedure (any observer, no privileged access):
 
@@ -143,5 +172,11 @@ Solvency check procedure (any observer, no privileged access):
 3. `rewardToken.balanceOf(phlimbo) − rewardBalance − Σ pendingStable >= 0` (§3).
 4. If `getPromoInfo().token != 0`:
    `promoToken.balanceOf(phlimbo) − promoRewardBalance − Σ pendingPromo −
-   unclaimablePromo >= 0` (§4), with the Σ terms enumerated via
+   totalUnclaimableOf(promoToken) >= 0` (§4), with the Σ terms enumerated via
    `stakerCount`/`stakerAt`.
+5. For every token `t` ever used as a promo token (enumerable off-chain from
+   `PromotionStarted` logs), including retired ones where
+   `getPromoInfo().token` no longer points at `t`:
+   `t.balanceOf(phlimbo) − totalUnclaimableOf(t) >= 0` (§4). A retired token
+   with a non-zero bank holds a real liability even while `promoToken == 0`;
+   step 4 alone does not cover it.
