@@ -336,6 +336,13 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
      *      routine lifecycle step and must NOT sweep the bank. A RETIRED token's
      *      bank (promoToken == address(0) for it) is unreachable here and stays
      *      pullable via `claimUnclaimablePromo`.
+     *
+     *      Same trade-off applies to the stable bank (audit-09 M-01): this sweeps the
+     *      entire `rewardToken` balance, INCLUDING any live `unclaimableStableOf`
+     *      amounts. `claimUnclaimableStable` has no `finalizePromotion`-equivalent
+     *      reserve (the stable token never rotates and is not swept as routine
+     *      leftover), so a live stable bank is reachable by this escape hatch —
+     *      making users whole afterward is the same out-of-band owner obligation.
      */
     function emergencyTransfer(address recipient) external onlyOwner {
         uint256 phUSDBalance = phUSD.balanceOf(address(this));
@@ -893,7 +900,18 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
         uint256 pendingRewardAmount = (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;
         if (pendingRewardAmount > 0) {
-            rewardToken.safeTransfer(beneficiary, pendingRewardAmount);
+            // Non-reverting claim (audit-09 M-01): a recipient-blocklisting rewardToken
+            // (USDC-class) must not brick the caller's principal path. Bank on failure
+            // and let the beneficiary pull later via claimUnclaimableStable. Credits the
+            // BENEFICIARY (funds route here, unlike batchClaim which forces the staker).
+            // No `:789` cap change is needed: the banked stable was already accrued out
+            // of `rewardBalance` (see _updatePool :795), so it is not part of the
+            // distributable balance and is never redistributed to other stakers.
+            if (!_tryTransfer(rewardToken, beneficiary, pendingRewardAmount)) {
+                unclaimableStableOf[beneficiary] += pendingRewardAmount;
+                totalUnclaimableStable += pendingRewardAmount;
+                emit StableClaimFailed(beneficiary, pendingRewardAmount);
+            }
         }
 
         if (pendingPhUSDAmount > 0 || pendingRewardAmount > 0) {
@@ -908,8 +926,18 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         if (address(promoToken) != address(0)) {
             uint256 pendingPromoAmount = (userDetails.amount * accPromoPerShare) / PRECISION - userDetails.promoDebt;
             if (pendingPromoAmount > 0) {
-                promoToken.safeTransfer(beneficiary, pendingPromoAmount);
-                emit PromoClaimed(user, pendingPromoAmount);
+                // Non-reverting claim (audit-09 M-01): mirror batchClaim's bank so a
+                // blocklisting promo token cannot brick the caller's principal path.
+                // REUSES story 027's promo bank; credits the BENEFICIARY (funds route
+                // here, unlike batchClaim which forces the staker). Banked promo lands
+                // in totalUnclaimableOf and is reserved by finalizePromotion's sweep.
+                if (_tryTransfer(promoToken, beneficiary, pendingPromoAmount)) {
+                    emit PromoClaimed(user, pendingPromoAmount);
+                } else {
+                    unclaimablePromoOf[address(promoToken)][beneficiary] += pendingPromoAmount;
+                    totalUnclaimableOf[address(promoToken)] += pendingPromoAmount;
+                    emit PromoClaimFailed(address(promoToken), beneficiary, pendingPromoAmount);
+                }
             }
         }
     }
@@ -957,6 +985,11 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
     /**
      * @notice Returns pending stable rewards for a user
+     * @dev Returns 0 for users whose self-service stable transfer failed and was
+     *      banked — BY DESIGN (audit-09 M-01): the caller realigns `stableDebt` after
+     *      `_claimRewards` banks, so banked recovery is surfaced via
+     *      `unclaimableStableOf` / `totalUnclaimableStable`, never here. Do NOT
+     *      "fix" this by un-aligning the debt — it would break the accrual invariant.
      */
     function pendingStable(address user) external view returns (uint256) {
         UserInfo storage userDetails = userInfo[user];
