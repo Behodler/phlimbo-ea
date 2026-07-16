@@ -37,12 +37,9 @@ import {IPausable} from "lib/mutable/pauser/src/interfaces/IPausable.sol";
  *                (NOT by the pause — `collectReward` and the owner setters are
  *                not `whenNotPaused`), so aligned debts stay aligned.
  *         3. Pause deltas from V2: owner may pause/unpause directly (external pauser
- *            still supported); `unpause()` reverts while flushing; `pauseWithdraw`
- *            realigns ALL reward debts to the reduced amount (fixes the latent V1/V2
- *            partial-pauseWithdraw brick, forfeiting unclaimed accruals).
+ *            still supported); `unpause()` reverts while flushing.
  *
  *         V1 (`PhlimboEA`) and V2 remain deployed; V3 coexists for migration.
- *         `pauseWithdraw` stays strictly msg.sender-only, not delegatable to migrator.
  */
 contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable {
     using SafeERC20 for IERC20;
@@ -196,7 +193,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     mapping(address => UserInfo) public userInfo;
 
     // ========================== EVENTS ==========================
-    // Note: Staked/Withdrawn/RewardsClaimed/EmergencyWithdrawal/MigratorSet/HookSet
+    // Note: Staked/Withdrawn/RewardsClaimed/MigratorSet/HookSet
     // are declared in IPhlimboV3.
 
     /// @notice Emitted when rewards are collected from yield-accumulator
@@ -442,7 +439,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
      * @notice Begins the rotation flush: final promo accrual up to now, then pause.
      *         Phase Active → Flushing.
      * @dev Pausing blocks all whenNotPaused ops, so from this point every user's
-     *      amount (except pauseWithdraw, which realigns debts) and the
+     *      amount and the
      *      staker set are frozen. accPromoPerShare is frozen NOT by the pause but
      *      by _updatePool's Flushing phase gate — collectReward and the owner
      *      setters reach _updatePool while paused. `_pause()` reverts if already
@@ -512,7 +509,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     /**
      * @notice Finalizes the rotation: requires full cursor coverage of the frozen
      *         staker set. Sweeps only the UNENCUMBERED promo token balance
-     *         (undistributed remainder + rounding dust + pauseWithdraw forfeits) to
+     *         (undistributed remainder + rounding dust) to
      *         `leftoverRecipient`; per-user banked amounts (`totalUnclaimableOf`)
      *         are reserved and survive the rotation (audit-08 M-01).
      *         Phase Flushing → None; owner then unpauses.
@@ -520,9 +517,9 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
      *      to it by the flush, so pending against the next token starts at exactly
      *      zero. Zeroing it while debts are non-zero would underflow amount*acc − debt.
      *
-     *      Forfeit-sweep vs bank-retain (audit-08 M-01): `pauseWithdraw` forfeits
-     *      realign the debt with NOTHING banked — those tokens are legitimately
-     *      swept here as leftover. Failed flush transfers, by contrast, are banked
+     *      Forfeit-sweep vs bank-retain (audit-08 M-01): undistributed remainder and
+     *      rounding dust have NOTHING banked — those tokens are legitimately swept
+     *      here as leftover. Failed flush transfers, by contrast, are banked
      *      per-user in `batchClaim` and reserved from this sweep via
      *      `totalUnclaimableOf`; they belong to users, not to `leftoverRecipient`.
      *
@@ -621,38 +618,6 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     function pause() public override {
         require(msg.sender == pauser || msg.sender == owner(), "Only pauser or owner can pause");
         _pause();
-    }
-
-    /**
-     * @notice Allows users to withdraw their staked phUSD when contract is paused
-     * @dev Emergency exit mechanism — strictly msg.sender-only. NOT delegatable to
-     *      migrator. Does NOT claim rewards or update pool. Does NOT invoke any hook.
-     *
-     *      V3 deltas from V2:
-     *      - Realigns ALL reward debts (phUSDDebt/stableDebt/promoDebt) to the
-     *        reduced amount, forfeiting unclaimed accruals. This fixes the latent
-     *        V1/V2 defect where a partial pauseWithdraw left debts computed against
-     *        the old, larger amount, so `amount * acc - debt` underflowed and
-     *        bricked the user's position after unpause.
-     *      - Does NOT touch `_stakers` membership: the set only mutates in
-     *        `whenNotPaused` ops, keeping it frozen during a flush. A user who
-     *        fully exits here is visited by the flush with pending == 0 (harmless).
-     */
-    function pauseWithdraw(uint256 amount) external whenPaused {
-        UserInfo storage user = userInfo[msg.sender];
-        require(user.amount >= amount, "Insufficient balance");
-        require(amount > 0, "Amount must be greater than 0");
-
-        user.amount -= amount;
-        totalStaked -= amount;
-
-        user.phUSDDebt = (user.amount * accPhUSDPerShare) / PRECISION;
-        user.stableDebt = (user.amount * accStablePerShare) / PRECISION;
-        user.promoDebt = (user.amount * accPromoPerShare) / PRECISION;
-
-        IERC20(address(phUSD)).safeTransfer(msg.sender, amount);
-
-        emit EmergencyWithdrawal(msg.sender, amount);
     }
 
     // ========================== REWARD COLLECTION ==========================

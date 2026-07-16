@@ -28,13 +28,6 @@ interface IPhlimboV3 {
     // ========================== EVENTS ==========================
 
     /**
-     * @notice Emitted when a user makes an emergency withdrawal while contract is paused
-     * @param user Address of the user withdrawing
-     * @param amount Amount of phUSD withdrawn
-     */
-    event EmergencyWithdrawal(address indexed user, uint256 amount);
-
-    /**
      * @notice Emitted when a user stakes phUSD
      * @param user Address of the user staking
      * @param amount Amount of phUSD staked
@@ -155,8 +148,8 @@ interface IPhlimboV3 {
      * @notice Emitted when a promotion is finalized and the slot cleared
      * @param token The promo token that was retired
      * @param leftoverRecipient Recipient of the leftover sweep
-     * @param leftoverAmount Amount swept (undistributed remainder + rounding dust +
-     *        pauseWithdraw forfeits; banked amounts in `totalUnclaimableOf` are
+     * @param leftoverAmount Amount swept (undistributed remainder + rounding dust;
+     *        banked amounts in `totalUnclaimableOf` are
      *        reserved and NOT swept)
      */
     event PromotionFinalized(address indexed token, address indexed leftoverRecipient, uint256 leftoverAmount);
@@ -205,7 +198,7 @@ interface IPhlimboV3 {
     /**
      * @notice Finalizes the rotation: requires the flush cursor to have covered the
      *         entire staker set. Sweeps only the unencumbered promo token balance
-     *         (leftover + rounding dust + pauseWithdraw forfeits) to
+     *         (leftover + rounding dust) to
      *         `leftoverRecipient` — banked amounts (`totalUnclaimableOf`) are
      *         reserved, saturating at zero, and survive the rotation — then clears
      *         the slot (promoToken/rate/balance zeroed; accPromoPerShare NEVER
@@ -306,14 +299,6 @@ interface IPhlimboV3 {
      * @param recipient Address to receive the tokens
      */
     function emergencyTransfer(address recipient) external;
-
-    /**
-     * @notice Allows users to withdraw their staked phUSD when contract is paused
-     * @dev Emergency exit mechanism - does NOT claim rewards or update pool. Strictly
-     *      msg.sender-only; migrator cannot delegate this call.
-     * @param amount Amount of phUSD to withdraw
-     */
-    function pauseWithdraw(uint256 amount) external;
 
     // ========================== REWARD COLLECTION ==========================
 
