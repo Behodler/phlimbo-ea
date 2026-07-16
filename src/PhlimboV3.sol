@@ -152,6 +152,21 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     ///         `finalizePromotion` sweep so banked entitlements are never swept.
     mapping(address => uint256) public totalUnclaimableOf;
 
+    /// @notice user => stable reward banked when a self-service `_claimRewards`
+    ///         transfer failed (recipient-blocklisting `rewardToken`, audit-09 M-01).
+    ///         Pulled via `claimUnclaimableStable`. NOT keyed by token: `rewardToken`
+    ///         is fixed at construction and never rotates (unlike the promo slot).
+    mapping(address => uint256) public unclaimableStableOf;
+
+    /// @notice Total stable still banked and unclaimed across all users. These tokens
+    ///         are physically held by the contract but were ALREADY accrued out of
+    ///         `rewardBalance` when they accrued (see `_updatePool` :795), so they are
+    ///         NOT part of the distributable balance the `:789` cap operates on and are
+    ///         never redistributed to other stakers. NO `:789` change is needed — and
+    ///         subtracting this at `:789` would double-exclude and strand legitimate
+    ///         undistributed rewards. Proven by the no-redistribution regression test.
+    uint256 public totalUnclaimableStable;
+
     // ========================== CONSTANTS ==========================
 
     /// @notice Precision multiplier for reward calculations
@@ -541,7 +556,7 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         promoPhase = PromoPhase.Active;
     }
 
-    // ========================== PROMO BANK (PERMISSIONLESS PULL) ==========================
+    // ========================== UNCLAIMABLE BANKS (PERMISSIONLESS PULL) ==========================
 
     /**
      * @notice Pulls the caller's banked promo for `token` — the amount recorded when
@@ -565,6 +580,29 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         totalUnclaimableOf[token] -= amount;
         IERC20(token).safeTransfer(msg.sender, amount);
         emit UnclaimablePromoClaimed(token, msg.sender, amount);
+    }
+
+    /**
+     * @notice Pulls the caller's banked stable reward — the amount recorded when a
+     *         self-service `_claimRewards` stable transfer to them failed
+     *         (audit-09 M-01). Permissionless and callable at any time.
+     * @dev Deliberately NOT `whenNotPaused`, matching `claimUnclaimablePromo` and its
+     *      rationale: `beginFlush` pauses the contract, so a gate would lock a
+     *      blocked-then-unblocked staker out of self-rescue for the whole flush
+     *      window. Uses a reverting `safeTransfer` (not `_tryTransfer`): a
+     *      user-initiated pull that fails while the caller is still blocked SHOULD
+     *      revert, leaving the bank intact. State writes precede the transfer
+     *      (checks-effects-interactions); `totalUnclaimableStable` is decremented by
+     *      exactly `amount` (mirrors `claimUnclaimablePromo` — it spans all users, so
+     *      it must never be zeroed on a single user's claim).
+     */
+    function claimUnclaimableStable() external nonReentrant {
+        uint256 amount = unclaimableStableOf[msg.sender];
+        require(amount > 0, "Nothing to claim");
+        unclaimableStableOf[msg.sender] = 0;
+        totalUnclaimableStable -= amount;
+        rewardToken.safeTransfer(msg.sender, amount);
+        emit UnclaimableStableClaimed(msg.sender, amount);
     }
 
     // ========================== PAUSE MECHANISM ==========================

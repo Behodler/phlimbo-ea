@@ -127,6 +127,30 @@ interface IPhlimboV3 {
      */
     event UnclaimablePromoClaimed(address indexed token, address indexed user, uint256 amount);
 
+    // ========================== STABLE BANK EVENTS ==========================
+
+    /**
+     * @notice Emitted when a self-service stable-reward transfer fails inside
+     *         `_claimRewards` and the amount is banked per-user into
+     *         `unclaimableStableOf[beneficiary]` instead (audit-09 M-01). The
+     *         caller's principal path continues; the amount is recoverable via
+     *         `claimUnclaimableStable`. Not keyed by token: `rewardToken` is fixed
+     *         at construction and never rotates.
+     * @param user The beneficiary credited with the banked stable (the fund
+     *        recipient, not necessarily the staked user — matches `_claimRewards`
+     *        routing; under migrator delegation this is the migrator)
+     * @param amount Amount banked
+     */
+    event StableClaimFailed(address indexed user, uint256 amount);
+
+    /**
+     * @notice Emitted when a user pulls a banked stable amount via
+     *         `claimUnclaimableStable`
+     * @param user User who pulled their banked amount
+     * @param amount Amount paid out
+     */
+    event UnclaimableStableClaimed(address indexed user, uint256 amount);
+
     /**
      * @notice Emitted when a promotion is finalized and the slot cleared
      * @param token The promo token that was retired
@@ -204,6 +228,17 @@ interface IPhlimboV3 {
      * @param token The promo token (live or retired) whose bank is being pulled
      */
     function claimUnclaimablePromo(address token) external;
+
+    /**
+     * @notice Pulls the caller's banked stable reward — the amount recorded when a
+     *         self-service `_claimRewards` stable transfer to them failed
+     *         (audit-09 M-01, a recipient-blocklisting `rewardToken`). Permissionless
+     *         and deliberately NOT pause-gated (self-rescue during a flush pause,
+     *         mirroring `claimUnclaimablePromo`). Reverts with "Nothing to claim"
+     *         when the caller has no bank, and reverts (reverting safeTransfer) while
+     *         the caller is still blocked.
+     */
+    function claimUnclaimableStable() external;
 
     // ========================== PROMO VIEWS ==========================
 
@@ -383,6 +418,12 @@ interface IPhlimboV3 {
     /// @notice token => total promo still banked and unclaimed across all users;
     ///         reserved from the `finalizePromotion` sweep (audit-08 M-01)
     function totalUnclaimableOf(address token) external view returns (uint256);
+    /// @notice user => stable reward banked when a self-service `_claimRewards`
+    ///         transfer failed; pulled via `claimUnclaimableStable` (audit-09 M-01)
+    function unclaimableStableOf(address user) external view returns (uint256);
+    /// @notice total stable still banked and unclaimed across all users. Already
+    ///         accrued out of `rewardBalance`, so never redistributed (audit-09 M-01)
+    function totalUnclaimableStable() external view returns (uint256);
 
     // ========================== STAKER ENUMERATION ==========================
 

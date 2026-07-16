@@ -36,6 +36,8 @@ contract PhlimboV3Test is Test {
     event PromoClaimFailed(address indexed token, address indexed user, uint256 amount);
     event UnclaimablePromoClaimed(address indexed token, address indexed user, uint256 amount);
     event PromotionFinalized(address indexed token, address indexed leftoverRecipient, uint256 leftoverAmount);
+    event StableClaimFailed(address indexed user, uint256 amount);
+    event UnclaimableStableClaimed(address indexed user, uint256 amount);
 
     PhlimboV3 public phlimbo;
     MockFlax public phUSD;
@@ -2207,5 +2209,335 @@ contract PhlimboV3Test is Test {
 
         phlimbo.batchClaim(10);
         assertEq(phlimbo.flushCursor(), 10);
+    }
+}
+
+/**
+ * @title PhlimboV3StableBankTest
+ * @notice audit-09 M-01 stable leg. Wires a MockBlocklistToken as the STABLE
+ *         `rewardToken` (no other test does this) and proves the self-service paths
+ *         (withdraw/stake/claim) no longer freeze a blocklisted staker's principal:
+ *         the failing stable transfer is banked into `unclaimableStableOf` and pulled
+ *         later via `claimUnclaimableStable`.
+ */
+contract PhlimboV3StableBankTest is Test {
+    event StableClaimFailed(address indexed user, uint256 amount);
+    event UnclaimableStableClaimed(address indexed user, uint256 amount);
+
+    PhlimboV3 public phlimbo;
+    MockFlax public phUSD;
+    MockBlocklistToken public stable;
+
+    address public owner = address(this);
+    address public alice = address(0x1);
+    address public bob = address(0x2);
+    address public migrator = address(0x5);
+    address public rewardDonor = address(0x3);
+
+    uint256 constant STAKE_AMOUNT = 1000 ether;
+    uint256 constant DEPLETION_DURATION = 604800;
+
+    function setUp() public {
+        phUSD = new MockFlax();
+        stable = new MockBlocklistToken();
+        phlimbo = new PhlimboV3(address(phUSD), address(stable), DEPLETION_DURATION);
+        phUSD.setMinter(address(phlimbo), true);
+
+        phUSD.mint(alice, 10000 ether);
+        phUSD.mint(bob, 10000 ether);
+        phUSD.mint(migrator, 10000 ether);
+
+        vm.prank(alice);
+        phUSD.approve(address(phlimbo), type(uint256).max);
+        vm.prank(bob);
+        phUSD.approve(address(phlimbo), type(uint256).max);
+        vm.prank(migrator);
+        phUSD.approve(address(phlimbo), type(uint256).max);
+
+        stable.mint(rewardDonor, 100000 ether);
+        vm.prank(rewardDonor);
+        stable.approve(address(phlimbo), type(uint256).max);
+    }
+
+    function _fundStable(uint256 amount) internal {
+        vm.prank(rewardDonor);
+        phlimbo.collectReward(amount);
+    }
+
+    // --- Core fix: blocked staker withdraws principal successfully, stable banked ---
+    function test_blockedStable_withdraw_succeeds_and_banks() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        _fundStable(1000 ether);
+        vm.warp(block.timestamp + 100000);
+        uint256 pending = phlimbo.pendingStable(alice);
+        assertGt(pending, 0, "alice should have accrued stable");
+
+        stable.setBlocked(alice, true);
+
+        uint256 balBefore = phUSD.balanceOf(alice);
+        vm.expectEmit(true, false, false, true);
+        emit StableClaimFailed(alice, pending);
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT, alice);
+
+        assertEq(phUSD.balanceOf(alice), balBefore + STAKE_AMOUNT, "principal returned");
+        assertEq(phlimbo.unclaimableStableOf(alice), pending, "stable banked");
+        assertEq(phlimbo.totalUnclaimableStable(), pending, "aggregate banked");
+        assertEq(phlimbo.pendingStable(alice), 0, "pending realigned to 0");
+    }
+
+    function test_blockedStable_claim_succeeds_and_banks() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        _fundStable(1000 ether);
+        vm.warp(block.timestamp + 100000);
+        stable.setBlocked(alice, true);
+        uint256 pending = phlimbo.pendingStable(alice);
+
+        vm.prank(alice);
+        phlimbo.claim(alice);
+
+        assertEq(phlimbo.unclaimableStableOf(alice), pending, "stable banked");
+        assertEq(phlimbo.pendingStable(alice), 0, "pending realigned");
+    }
+
+    function test_blockedStable_stake_succeeds_and_banks() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        _fundStable(1000 ether);
+        vm.warp(block.timestamp + 100000);
+        stable.setBlocked(alice, true);
+        uint256 pending = phlimbo.pendingStable(alice);
+
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+
+        assertEq(phlimbo.unclaimableStableOf(alice), pending, "stable banked on stake");
+    }
+
+    // --- No-redistribution regression (Nuance 1) ---
+    function test_bankedStable_notRedistributed_toCostaker() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT, bob);
+        _fundStable(1000 ether);
+        vm.warp(block.timestamp + 100000);
+
+        uint256 bobPendingBefore = phlimbo.pendingStable(bob);
+        assertGt(bobPendingBefore, 0, "bob accrued");
+
+        stable.setBlocked(alice, true);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+
+        // Banked stable must NOT be redistributed into bob's accrual.
+        assertEq(phlimbo.pendingStable(bob), bobPendingBefore, "co-staker pending unchanged");
+    }
+
+    // --- Stable pull round-trip ---
+    function test_claimUnclaimableStable_roundTrip() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        _fundStable(1000 ether);
+        vm.warp(block.timestamp + 100000);
+        stable.setBlocked(alice, true);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+        uint256 banked = phlimbo.unclaimableStableOf(alice);
+        assertGt(banked, 0, "banked");
+
+        // Reverts while still blocked.
+        vm.prank(alice);
+        vm.expectRevert("recipient blocked");
+        phlimbo.claimUnclaimableStable();
+
+        // Unblock and pull.
+        stable.setBlocked(alice, false);
+        vm.expectEmit(true, false, false, true);
+        emit UnclaimableStableClaimed(alice, banked);
+        vm.prank(alice);
+        phlimbo.claimUnclaimableStable();
+
+        assertEq(stable.balanceOf(alice), banked, "paid in full");
+        assertEq(phlimbo.unclaimableStableOf(alice), 0, "bank cleared");
+        assertEq(phlimbo.totalUnclaimableStable(), 0, "aggregate cleared");
+
+        // Reverts on zero balance.
+        vm.prank(alice);
+        vm.expectRevert("Nothing to claim");
+        phlimbo.claimUnclaimableStable();
+    }
+
+    function test_claimUnclaimableStable_ungatedByPause() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        _fundStable(1000 ether);
+        vm.warp(block.timestamp + 100000);
+        stable.setBlocked(alice, true);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+        uint256 banked = phlimbo.unclaimableStableOf(alice);
+        stable.setBlocked(alice, false);
+
+        // Pause the contract; the self-rescue pull must still work.
+        phlimbo.pause();
+        vm.prank(alice);
+        phlimbo.claimUnclaimableStable();
+        assertEq(stable.balanceOf(alice), banked, "pull works while paused");
+    }
+
+    // --- Migrator delegation recovery path ---
+    function test_migrator_claim_routesToMigrator_unsticksBlockedUser() public {
+        phlimbo.setMigrator(migrator);
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        _fundStable(1000 ether);
+        vm.warp(block.timestamp + 100000);
+        stable.setBlocked(alice, true);
+
+        uint256 pending = phlimbo.pendingStable(alice);
+        // Migrator (unblocked) claims on behalf of the blocked user; stable lands with migrator.
+        vm.prank(migrator);
+        phlimbo.claim(alice);
+        assertEq(stable.balanceOf(migrator), pending, "stable routed to migrator");
+        assertEq(phlimbo.totalUnclaimableStable(), 0, "nothing banked (migrator unblocked)");
+        assertEq(phlimbo.pendingStable(alice), 0, "blocked user's debt realigned");
+
+        // Alice's subsequent self-service withdraw no longer touches the stable leg.
+        uint256 balBefore = phUSD.balanceOf(alice);
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT, alice);
+        assertEq(phUSD.balanceOf(alice), balBefore + STAKE_AMOUNT, "principal freed");
+    }
+}
+
+/**
+ * @title PhlimboV3PromoBankSelfServiceTest
+ * @notice audit-09 M-01 promo leg. Uses a plain stable `rewardToken` and a
+ *         MockBlocklistToken as the PROMO token, proving the self-service paths bank
+ *         a failed promo transfer into the EXISTING `unclaimablePromoOf` bank
+ *         (story 027 infra, credited to the beneficiary) — distinct from the
+ *         `batchClaim`-path tests above — and that the bank survives a finalize.
+ */
+contract PhlimboV3PromoBankSelfServiceTest is Test {
+    event PromoClaimFailed(address indexed token, address indexed user, uint256 amount);
+
+    PhlimboV3 public phlimbo;
+    MockFlax public phUSD;
+    MockStable public stable;
+    MockBlocklistToken public blkPromo;
+
+    address public owner = address(this);
+    address public alice = address(0x1);
+    address public migrator = address(0x5);
+    address public rewardDonor = address(0x3);
+
+    uint256 constant STAKE_AMOUNT = 1000 ether;
+    uint256 constant DEPLETION_DURATION = 604800;
+    uint256 constant PROMO_AMOUNT = 1000 ether;
+    uint256 constant PROMO_DURATION = 1_000_000;
+
+    function setUp() public {
+        phUSD = new MockFlax();
+        stable = new MockStable();
+        phlimbo = new PhlimboV3(address(phUSD), address(stable), DEPLETION_DURATION);
+        phUSD.setMinter(address(phlimbo), true);
+
+        phUSD.mint(alice, 10000 ether);
+        phUSD.mint(migrator, 10000 ether);
+        vm.prank(alice);
+        phUSD.approve(address(phlimbo), type(uint256).max);
+        vm.prank(migrator);
+        phUSD.approve(address(phlimbo), type(uint256).max);
+
+        blkPromo = new MockBlocklistToken();
+        blkPromo.mint(owner, 10 * PROMO_AMOUNT);
+        blkPromo.approve(address(phlimbo), type(uint256).max);
+    }
+
+    function test_blockedPromo_withdraw_banks_and_pull() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        phlimbo.startPromotion(address(blkPromo), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + 10000);
+        uint256 pending = phlimbo.pendingPromo(alice);
+        assertGt(pending, 0, "alice accrued promo");
+        blkPromo.setBlocked(alice, true);
+
+        uint256 balBefore = phUSD.balanceOf(alice);
+        vm.expectEmit(true, true, false, true);
+        emit PromoClaimFailed(address(blkPromo), alice, pending);
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT, alice);
+
+        assertEq(phUSD.balanceOf(alice), balBefore + STAKE_AMOUNT, "principal returned");
+        assertEq(phlimbo.unclaimablePromoOf(address(blkPromo), alice), pending, "promo banked");
+        assertEq(phlimbo.totalUnclaimableOf(address(blkPromo)), pending, "aggregate banked");
+        assertEq(phlimbo.pendingPromo(alice), 0, "pending realigned");
+
+        blkPromo.setBlocked(alice, false);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePromo(address(blkPromo));
+        assertEq(blkPromo.balanceOf(alice), pending, "made whole");
+    }
+
+    function test_blockedPromo_claim_banks() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        phlimbo.startPromotion(address(blkPromo), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + 10000);
+        blkPromo.setBlocked(alice, true);
+        uint256 pending = phlimbo.pendingPromo(alice);
+
+        vm.prank(alice);
+        phlimbo.claim(alice);
+
+        assertEq(phlimbo.unclaimablePromoOf(address(blkPromo), alice), pending, "promo banked on claim");
+    }
+
+    function test_promo_bankedViaClaimRewards_survivesFinalize() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        phlimbo.startPromotion(address(blkPromo), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + 10000);
+        blkPromo.setBlocked(alice, true);
+
+        // Self-service claim banks promo via _claimRewards (Active phase).
+        vm.prank(alice);
+        phlimbo.claim(alice);
+        uint256 banked = phlimbo.unclaimablePromoOf(address(blkPromo), alice);
+        assertGt(banked, 0, "banked via _claimRewards");
+
+        // Owner rotates the promo slot.
+        phlimbo.beginFlush();
+        phlimbo.batchClaim(10);
+        phlimbo.finalizePromotion(owner);
+        phlimbo.unpause();
+
+        // Bank survived rotation (reserved from the sweep); pull after unblock.
+        assertEq(phlimbo.unclaimablePromoOf(address(blkPromo), alice), banked, "bank survived finalize");
+        blkPromo.setBlocked(alice, false);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePromo(address(blkPromo));
+        assertEq(blkPromo.balanceOf(alice), banked, "pullable after rotation");
+    }
+
+    function test_migrator_claim_routesPromoToMigrator() public {
+        phlimbo.setMigrator(migrator);
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        phlimbo.startPromotion(address(blkPromo), PROMO_AMOUNT, PROMO_DURATION);
+        vm.warp(block.timestamp + 10000);
+        blkPromo.setBlocked(alice, true);
+
+        uint256 pending = phlimbo.pendingPromo(alice);
+        vm.prank(migrator);
+        phlimbo.claim(alice);
+
+        assertEq(blkPromo.balanceOf(migrator), pending, "promo routed to migrator");
+        assertEq(phlimbo.totalUnclaimableOf(address(blkPromo)), 0, "nothing banked (migrator unblocked)");
+        assertEq(phlimbo.pendingPromo(alice), 0, "blocked user debt realigned");
     }
 }
