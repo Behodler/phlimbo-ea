@@ -144,6 +144,32 @@ interface IPhlimboV3 {
      */
     event UnclaimableStableClaimed(address indexed user, uint256 amount);
 
+    // ========================== PHUSD BANK EVENTS ==========================
+
+    /**
+     * @notice Emitted when a self-service phUSD-reward `mint` fails inside
+     *         `_claimRewards` and the amount is banked per-user into
+     *         `unclaimablePhUSDOf[beneficiary]` instead (audit-09 V3-M-05 / V3-L-14).
+     *         The only trigger is PhlimboV3 losing mint authority on phUSD (an
+     *         owner-privileged, fully recoverable condition). The caller's principal
+     *         path continues; the amount is recoverable via `claimUnclaimablePhUSD`,
+     *         which re-mints once authority is restored. Not keyed by token: `phUSD`
+     *         is fixed at construction and never rotates.
+     * @param beneficiary The beneficiary credited with the banked phUSD (the reward
+     *        recipient, not necessarily the staked user — matches `_claimRewards`
+     *        routing; under migrator delegation this is the migrator)
+     * @param amount Amount banked
+     */
+    event PhUSDMintFailed(address indexed beneficiary, uint256 amount);
+
+    /**
+     * @notice Emitted when a user pulls a banked phUSD amount via
+     *         `claimUnclaimablePhUSD` (re-minted, not transferred)
+     * @param user User who pulled their banked amount
+     * @param amount Amount minted out
+     */
+    event UnclaimablePhUSDClaimed(address indexed user, uint256 amount);
+
     /**
      * @notice Emitted when a promotion is finalized and the slot cleared
      * @param token The promo token that was retired
@@ -232,6 +258,18 @@ interface IPhlimboV3 {
      *         the caller is still blocked.
      */
     function claimUnclaimableStable() external;
+
+    /**
+     * @notice Pulls the caller's banked phUSD reward — the amount recorded when a
+     *         self-service `_claimRewards` mint to them failed (audit-09 V3-M-05 /
+     *         V3-L-14, PhlimboV3 lacking mint authority on phUSD). Permissionless and
+     *         deliberately NOT pause-gated (self-rescue during a flush pause, mirroring
+     *         `claimUnclaimableStable`). Unlike the stable/promo pulls this RE-MINTS
+     *         `phUSD` to the caller (the tokens were never minted, so nothing is held
+     *         to transfer). Reverts with "Nothing to claim" when the caller has no
+     *         bank, and reverts (reverting mint) while authority is still missing.
+     */
+    function claimUnclaimablePhUSD() external;
 
     // ========================== PROMO VIEWS ==========================
 
@@ -409,6 +447,14 @@ interface IPhlimboV3 {
     /// @notice total stable still banked and unclaimed across all users. Already
     ///         accrued out of `rewardBalance`, so never redistributed (audit-09 M-01)
     function totalUnclaimableStable() external view returns (uint256);
+    /// @notice user => phUSD reward banked when a self-service `_claimRewards` mint
+    ///         failed; pulled (re-minted) via `claimUnclaimablePhUSD`
+    ///         (audit-09 V3-M-05 / V3-L-14)
+    function unclaimablePhUSDOf(address user) external view returns (uint256);
+    /// @notice total phUSD still banked and unclaimed across all users. Never minted
+    ///         (the mint reverted), so nothing is held; re-minted on pull
+    ///         (audit-09 V3-M-05 / V3-L-14)
+    function totalUnclaimablePhUSD() external view returns (uint256);
 
     // ========================== STAKER ENUMERATION ==========================
 

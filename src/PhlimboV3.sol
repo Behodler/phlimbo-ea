@@ -164,6 +164,22 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
     ///         undistributed rewards. Proven by the no-redistribution regression test.
     uint256 public totalUnclaimableStable;
 
+    /// @notice user => phUSD reward banked when a self-service `_claimRewards` mint
+    ///         failed (PhlimboV3 lost mint authority on phUSD, audit-09 V3-M-05 /
+    ///         V3-L-14). Pulled via `claimUnclaimablePhUSD`. NOT keyed by token:
+    ///         `phUSD` is fixed at construction and never rotates (mirrors
+    ///         `unclaimableStableOf`).
+    mapping(address => uint256) public unclaimablePhUSDOf;
+
+    /// @notice Total phUSD still banked and unclaimed across all users. Unlike the
+    ///         stable bank, these tokens were NEVER minted (the mint reverted), so the
+    ///         contract custodies nothing against this balance — `claimUnclaimablePhUSD`
+    ///         re-mints on pull. Incremented alongside `unclaimablePhUSDOf` in
+    ///         `_claimRewards`, decremented by exactly the pulled amount (never zeroed
+    ///         wholesale — it spans all users). No `:789`-style cap interaction exists:
+    ///         phUSD emission is uncapped minting, not drawn from a distributable pool.
+    uint256 public totalUnclaimablePhUSD;
+
     // ========================== CONSTANTS ==========================
 
     /// @notice Precision multiplier for reward calculations
@@ -609,6 +625,31 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
         emit UnclaimableStableClaimed(msg.sender, amount);
     }
 
+    /**
+     * @notice Pulls the caller's banked phUSD reward — the amount recorded when a
+     *         self-service `_claimRewards` mint to them failed (audit-09 V3-M-05 /
+     *         V3-L-14, PhlimboV3 lacking mint authority on phUSD). Permissionless and
+     *         callable at any time.
+     * @dev Deliberately NOT `whenNotPaused`, matching `claimUnclaimableStable` /
+     *      `claimUnclaimablePromo` and their rationale: `beginFlush` pauses the
+     *      contract, so a gate would lock a user out of self-rescue for the whole flush
+     *      window. Unlike the stable/promo pulls this RE-MINTS `phUSD` to the caller —
+     *      the tokens were never minted, so the contract holds nothing to transfer. A
+     *      pull that fails because authority is still missing SHOULD revert, leaving the
+     *      bank intact (exactly the `claimUnclaimableStable` recoverability semantics).
+     *      State writes precede the mint (checks-effects-interactions);
+     *      `totalUnclaimablePhUSD` is decremented by exactly `amount` — it spans all
+     *      users, so it must never be zeroed on a single user's claim.
+     */
+    function claimUnclaimablePhUSD() external nonReentrant {
+        uint256 amount = unclaimablePhUSDOf[msg.sender];
+        require(amount > 0, "Nothing to claim");
+        unclaimablePhUSDOf[msg.sender] = 0;
+        totalUnclaimablePhUSD -= amount;
+        phUSD.mint(msg.sender, amount);
+        emit UnclaimablePhUSDClaimed(msg.sender, amount);
+    }
+
     // ========================== PAUSE MECHANISM ==========================
 
     /**
@@ -860,7 +901,21 @@ contract PhlimboV3 is Ownable, Pausable, ReentrancyGuard, IPhlimboV3, IPausable 
 
         uint256 pendingPhUSDAmount = (userDetails.amount * accPhUSDPerShare) / PRECISION - userDetails.phUSDDebt;
         if (pendingPhUSDAmount > 0) {
-            phUSD.mint(beneficiary, pendingPhUSDAmount);
+            // Non-reverting claim (audit-09 V3-M-05 / V3-L-14): if PhlimboV3 ever loses
+            // mint authority on phUSD, the mint must not brick the caller's principal
+            // path. Bank on failure and let the beneficiary pull later via
+            // claimUnclaimablePhUSD (which RE-MINTS — the tokens were never minted).
+            // `IFlax.mint` returns void, so try/catch is used instead of the
+            // bool-decoding `_tryTransfer`. Credits the BENEFICIARY, mirroring the
+            // stable leg below. The caller realigns `phUSDDebt` after `_claimRewards`
+            // returns (stake/withdraw/claim), so pending settles to zero either way and
+            // the banked amount is never double-credited.
+            try phUSD.mint(beneficiary, pendingPhUSDAmount) {}
+            catch {
+                unclaimablePhUSDOf[beneficiary] += pendingPhUSDAmount;
+                totalUnclaimablePhUSD += pendingPhUSDAmount;
+                emit PhUSDMintFailed(beneficiary, pendingPhUSDAmount);
+            }
         }
 
         uint256 pendingRewardAmount = (userDetails.amount * accStablePerShare) / PRECISION - userDetails.stableDebt;

@@ -2378,3 +2378,172 @@ contract PhlimboV3PromoBankSelfServiceTest is Test {
         assertEq(phlimbo.pendingPromo(alice), 0, "blocked user debt realigned");
     }
 }
+
+/**
+ * @title PhlimboV3PhUSDMintBankTest
+ * @notice audit-09 V3-M-05 / V3-L-14 phUSD mint leg. Uses a MockRevertingMintFlax as
+ *         the phUSD stake+reward token so the `_claimRewards` mint can be forced to
+ *         revert (models PhlimboV3 losing mint authority). Proves the self-service
+ *         paths (claim/withdraw) no longer freeze a staker's principal: the failing
+ *         mint is banked into `unclaimablePhUSDOf` and RE-MINTED later via
+ *         `claimUnclaimablePhUSD`. Mirrors PhlimboV3StableBankTest.
+ */
+contract PhlimboV3PhUSDMintBankTest is Test {
+    event PhUSDMintFailed(address indexed beneficiary, uint256 amount);
+    event UnclaimablePhUSDClaimed(address indexed user, uint256 amount);
+
+    PhlimboV3 public phlimbo;
+    MockRevertingMintFlax public phUSD;
+    MockStable public stable;
+
+    address public owner = address(this);
+    address public alice = address(0x1);
+    address public bob = address(0x2);
+    address public migrator = address(0x5);
+    address public rewardDonor = address(0x3);
+
+    uint256 constant STAKE_AMOUNT = 1000 ether;
+    uint256 constant DEPLETION_DURATION = 604800;
+
+    function setUp() public {
+        phUSD = new MockRevertingMintFlax();
+        stable = new MockStable();
+        phlimbo = new PhlimboV3(address(phUSD), address(stable), DEPLETION_DURATION);
+        phUSD.setMinter(address(phlimbo), true);
+
+        phUSD.mint(alice, 10000 ether);
+        phUSD.mint(bob, 10000 ether);
+        phUSD.mint(migrator, 10000 ether);
+
+        vm.prank(alice);
+        phUSD.approve(address(phlimbo), type(uint256).max);
+        vm.prank(bob);
+        phUSD.approve(address(phlimbo), type(uint256).max);
+        vm.prank(migrator);
+        phUSD.approve(address(phlimbo), type(uint256).max);
+
+        stable.mint(rewardDonor, 100000 ether);
+        vm.prank(rewardDonor);
+        stable.approve(address(phlimbo), type(uint256).max);
+
+        // Non-zero APY so phUSD rewards accrue (two-step: preview then commit).
+        phlimbo.setDesiredAPY(500);
+        phlimbo.setDesiredAPY(500);
+    }
+
+    // --- Core fix: claim succeeds and banks when the phUSD mint reverts ---
+    function test_revertingMint_claim_succeeds_and_banks() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.warp(block.timestamp + 100000);
+
+        uint256 pending = phlimbo.pendingPhUSD(alice);
+        assertGt(pending, 0, "alice should have accrued phUSD");
+
+        // PhlimboV3 loses mint authority.
+        phUSD.setMintReverts(true);
+
+        vm.expectEmit(true, false, false, true);
+        emit PhUSDMintFailed(alice, pending);
+        vm.prank(alice);
+        phlimbo.claim(alice); // must NOT revert
+
+        assertEq(phlimbo.unclaimablePhUSDOf(alice), pending, "phUSD banked");
+        assertEq(phlimbo.totalUnclaimablePhUSD(), pending, "aggregate banked");
+        assertEq(phlimbo.pendingPhUSD(alice), 0, "pending realigned to 0");
+    }
+
+    // --- Principal path stays live: withdraw returns stake even when mint reverts ---
+    function test_revertingMint_withdraw_returns_principal_and_banks() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.warp(block.timestamp + 100000);
+
+        uint256 pending = phlimbo.pendingPhUSD(alice);
+        assertGt(pending, 0, "alice accrued phUSD");
+        phUSD.setMintReverts(true);
+
+        uint256 balBefore = phUSD.balanceOf(alice);
+        vm.prank(alice);
+        phlimbo.withdraw(STAKE_AMOUNT, alice); // principal transfer, mint banked
+
+        // Principal returned (transfer, not mint) even though the reward mint failed.
+        assertEq(phUSD.balanceOf(alice), balBefore + STAKE_AMOUNT, "principal returned");
+        assertEq(phlimbo.unclaimablePhUSDOf(alice), pending, "phUSD reward banked");
+        assertEq(phlimbo.totalUnclaimablePhUSD(), pending, "aggregate banked");
+    }
+
+    // --- Pull re-mints the exact banked amount once authority is restored ---
+    function test_claimUnclaimablePhUSD_roundTrip() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.warp(block.timestamp + 100000);
+        phUSD.setMintReverts(true);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+
+        uint256 banked = phlimbo.unclaimablePhUSDOf(alice);
+        assertGt(banked, 0, "banked");
+
+        // Reverts while mint authority is still missing (bank intact).
+        vm.prank(alice);
+        vm.expectRevert("mint not authorized");
+        phlimbo.claimUnclaimablePhUSD();
+        assertEq(phlimbo.unclaimablePhUSDOf(alice), banked, "bank intact after failed pull");
+
+        // Restore authority and pull — re-mints exactly the banked amount.
+        phUSD.setMintReverts(false);
+        uint256 balBefore = phUSD.balanceOf(alice);
+        vm.expectEmit(true, false, false, true);
+        emit UnclaimablePhUSDClaimed(alice, banked);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePhUSD();
+
+        assertEq(phUSD.balanceOf(alice), balBefore + banked, "re-minted in full");
+        assertEq(phlimbo.unclaimablePhUSDOf(alice), 0, "bank cleared");
+        assertEq(phlimbo.totalUnclaimablePhUSD(), 0, "aggregate cleared");
+
+        // Reverts on zero balance.
+        vm.prank(alice);
+        vm.expectRevert("Nothing to claim");
+        phlimbo.claimUnclaimablePhUSD();
+    }
+
+    // --- Self-rescue pull is not pause-gated ---
+    function test_claimUnclaimablePhUSD_ungatedByPause() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.warp(block.timestamp + 100000);
+        phUSD.setMintReverts(true);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+        uint256 banked = phlimbo.unclaimablePhUSDOf(alice);
+        phUSD.setMintReverts(false);
+
+        // Pause the contract; the self-rescue pull must still work.
+        phlimbo.pause();
+        uint256 balBefore = phUSD.balanceOf(alice);
+        vm.prank(alice);
+        phlimbo.claimUnclaimablePhUSD();
+        assertEq(phUSD.balanceOf(alice), balBefore + banked, "pull works while paused");
+    }
+
+    // --- Banked phUSD must not leak into a co-staker's accrual ---
+    function test_bankedPhUSD_notRedistributed_toCostaker() public {
+        vm.prank(alice);
+        phlimbo.stake(STAKE_AMOUNT, alice);
+        vm.prank(bob);
+        phlimbo.stake(STAKE_AMOUNT, bob);
+        vm.warp(block.timestamp + 100000);
+
+        uint256 bobPendingBefore = phlimbo.pendingPhUSD(bob);
+        assertGt(bobPendingBefore, 0, "bob accrued");
+
+        phUSD.setMintReverts(true);
+        vm.prank(alice);
+        phlimbo.claim(alice);
+
+        // Alice's banked phUSD is minted independently, so bob's accrual is untouched.
+        assertEq(phlimbo.pendingPhUSD(bob), bobPendingBefore, "co-staker pending unchanged");
+    }
+}

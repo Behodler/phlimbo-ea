@@ -41,6 +41,48 @@ contract MockFlax is ERC20 {
 }
 
 /**
+ * @title MockRevertingMintFlax
+ * @notice MockFlax variant whose `mint` reverts while `mintReverts` is set — models
+ *         PhlimboV3 losing mint authority on phUSD (audit-09 V3-M-05 / V3-L-14).
+ *         Transfers are unaffected, so it doubles as the stake token: fund/stake with
+ *         mint enabled, then flip `setMintReverts(true)` to make the reward mint leg
+ *         fail and be banked. Flip back to let `claimUnclaimablePhUSD` re-mint.
+ */
+contract MockRevertingMintFlax is ERC20 {
+    mapping(address => bool) public minters;
+    bool public mintReverts;
+
+    constructor() ERC20("Mock Reverting Flax", "mRFLX") {}
+
+    function setMinter(address minter, bool canMint) external {
+        minters[minter] = canMint;
+    }
+
+    function setMintReverts(bool value) external {
+        mintReverts = value;
+    }
+
+    function mint(address recipient, uint256 amount) external {
+        require(!mintReverts, "mint not authorized");
+        _mint(recipient, amount);
+    }
+
+    function burn(address holder, uint256 amount) external {
+        _burn(holder, amount);
+    }
+
+    function authorizedMinters(address minter) external view returns (IFlax.MinterInfo memory) {
+        return IFlax.MinterInfo({canMint: minters[minter], mintVersion: 1});
+    }
+
+    function mintVersion() external pure returns (uint256) {
+        return 1;
+    }
+
+    function revokeAllMintPrivileges() external {}
+}
+
+/**
  * @title MockStable
  * @notice Mock stablecoin token for testing
  */
