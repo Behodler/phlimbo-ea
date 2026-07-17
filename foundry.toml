@@ -3,5 +3,15 @@ src = "src"
 out = "out"
 libs = ["lib"]
 # Remappings are in remappings.txt for IDE extension compatibility
+optimizer = true
+optimizer_runs = 10000
+# via_ir OFF for local/unit builds only. Reason: with via_ir the optimizer caches
+# block.timestamp within a frame (a valid on-chain invariant), which collapses the
+# repeated `vm.warp(block.timestamp + ...)` calls some tests use for cumulative time
+# progression -> those tests see time frozen and read 0 rewards. The CONTRACTS are
+# correct; this is purely a test<->cheatcode interaction. Legacy + optimizer also
+# fits EIP-170 (~16 KB, +8.6 KB margin). Deploying with via_ir is safe (no vm.warp
+# on-chain; block.timestamp is genuinely constant within a real tx).
+via_ir = false
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
